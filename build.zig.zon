@@ -1,0 +1,13 @@
+.{
+    .name = .starlark_zig,
+    .version = "0.0.1",
+    .dependencies = .{
+        .libgc = .{
+            .url = "git+https://github.com/ivmai/bdwgc?ref=v8.2.8#ee59af3722e56de8404de6cd0c21c2493cc4d855",
+            .hash = "N-V-__8AAF3VLgDRyITgWEqJgaBLG9Rui3kyYBNddwmeyy8k",
+        },
+    },
+    .minimum_zig_version = "0.15.1",
+    .paths = .{""},
+    .fingerprint = 0x29e6fe530c29808e,
+}
