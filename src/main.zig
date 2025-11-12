@@ -24,19 +24,17 @@ pub fn main() !void {
 
     const code: [:0]const u8 =
         \\asdf = 1
+        \\def foo(a):
+        \\    b = 2
     ;
-    const ast: Ast = try .parse(gpa, code);
-    for (0..ast.tokens.len) |i| {
-        const token = ast.tokens.get(i);
-        if (token.tag == .invalid) return error.WTF;
-        try stdout.print("Result: {any}\n", .{token});
-        try stdout.print("Raw: ###{s}###\n", .{code[token.loc.start..token.loc.end]});
-    }
+    var ast: Ast = try .parse(gpa, code);
+    defer ast.deinit();
+    try stdout.print("AST:\n{f}\n", .{Ast.DebugNodeFormatter{ .data = &ast }});
 }
 
 test {
     // TODO: Delete me
-    _ = @import("Runtime.zig");
+    // _ = @import("Runtime.zig");
     _ = @import("Compiler.zig");
     std.testing.refAllDecls(@This());
 }

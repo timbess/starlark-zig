@@ -14,8 +14,10 @@ stack: std.ArrayList(*StarObj) = .empty,
 
 pub const InitOpts = struct {};
 
+pub const GlobalIdx = enum(u32) { _ };
 pub const LocalIdx = enum(u32) { _ };
 pub const ConstIdx = enum(u32) { _ };
+pub const NameIdx = enum(u32) { _ };
 pub const FreeVarIdx = enum(u32) { _ };
 
 pub const Arity = u32;
@@ -26,6 +28,7 @@ pub const Instruction = union(enum) {
     load: LocalIdx,
     load_const: ConstIdx,
     store: LocalIdx,
+    store_global: NameIdx,
     binary_op: BinOp,
     call: Arity,
     ret: void,
@@ -160,6 +163,7 @@ pub fn step(self: *Runtime) Error!void {
             const val = try self.stackPop();
             try frame.writeLocal(idx, val);
         },
+        .store_global => |_| @panic("not implemented"),
         .binary_op => |op| {
             const rhs = try self.stackPop();
             const lhs = try self.stackPop();

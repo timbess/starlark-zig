@@ -37,6 +37,7 @@ pub const Token = struct {
         block_start,
         block_end,
         keyword_def,
+        keyword_return,
         colon,
         star,
         starstar,
@@ -49,6 +50,7 @@ pub const Token = struct {
 
     const keywords = std.StaticStringMap(Tag).initComptime(.{
         .{ "def", .keyword_def },
+        .{ "return", .keyword_return },
     });
 
     pub fn getKeyword(name: []const u8) ?Tag {
@@ -56,7 +58,7 @@ pub const Token = struct {
     }
 };
 
-const Error = error{UnexpectedToken};
+const Error = error{};
 
 pub fn init(source: [:0]const u8) Tokenizer {
     return Tokenizer{
@@ -64,6 +66,7 @@ pub fn init(source: [:0]const u8) Tokenizer {
     };
 }
 
+// TODO: Does this need to be fallible if tokens can be invalid? Maybe invalid shouldn't be a tag.
 pub fn next(self: *Tokenizer) Error!Token {
     var result: Token = .{ .tag = undefined, .loc = .{
         .start = self.index,
@@ -291,6 +294,7 @@ test Tokenizer {
             \\
             \\def my_fn(name):
             \\  println(name)
+            \\  return 1
         ;
 
         var tokenizer = Tokenizer.init(code);
@@ -321,6 +325,8 @@ test Tokenizer {
         try Test.expectToken(&tokenizer, .{ .tag = .l_paren,        .text = "(" });
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "name" });
         try Test.expectToken(&tokenizer, .{ .tag = .r_paren,        .text = ")" });
+        try Test.expectToken(&tokenizer, .{ .tag = .keyword_return, .text = "return" });
+        try Test.expectToken(&tokenizer, .{ .tag = .number_literal, .text = "1" });
         try Test.expectToken(&tokenizer, .{ .tag = .block_end,      .text = "" });
         try Test.expectToken(&tokenizer, .{ .tag = .eof,            .text = "" });
         // zig fmt: on
