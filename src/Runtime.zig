@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Tokenizer = @import("Tokenizer.zig");
+const Compiler = @import("Compiler.zig");
 const Token = Tokenizer.Token;
 const Ast = @import("Ast.zig");
 const Gc = @import("zig_libgc");
@@ -11,6 +12,8 @@ gc: Allocator,
 frames: std.ArrayList(Frame) = .empty,
 /// Value stack
 stack: std.ArrayList(*StarObj) = .empty,
+/// Globals
+globals: std.StringHashMapUnmanaged(*StarObj) = .empty,
 
 pub const InitOpts = struct {};
 
@@ -28,7 +31,7 @@ pub const Instruction = union(enum) {
     load: LocalIdx,
     load_const: ConstIdx,
     store: LocalIdx,
-    store_global: NameIdx,
+    store_global: GlobalIdx,
     binary_op: BinOp,
     call: Arity,
     ret: void,
@@ -99,11 +102,12 @@ pub fn deinit(self: *Runtime) void {
     }
     self.frames.deinit(self.gc);
     self.stack.deinit(self.gc);
+    self.globals.deinit(self.gc);
 }
 
 /// Create and push a new frame for `func`. Copies args into locals[0..arity).
 /// ret_addr is the caller's next-pc (an index into the caller's code).
-fn call_fn(self: *Runtime, func: *StarFunc, args: []*StarObj) Error!void {
+fn callFn(self: *Runtime, func: *StarFunc, args: []*StarObj) Error!void {
     if (args.len != func.arity) return RuntimeError.WrongArity;
     std.debug.assert(func.frame_size >= func.arity);
 
@@ -127,16 +131,35 @@ fn call_fn(self: *Runtime, func: *StarFunc, args: []*StarObj) Error!void {
     try self.frames.append(self.gc, frame);
 }
 
-inline fn stackPop(self: *Runtime) Error!*StarObj {
+fn stackPop(self: *Runtime) Error!*StarObj {
     return self.stack.pop() orelse return Error.StackUnderflow;
 }
 
-inline fn stackPush(self: *Runtime, obj: *StarObj) Error!void {
+fn stackPush(self: *Runtime, obj: *StarObj) Error!void {
     try self.stack.append(self.gc, obj);
 }
 
-inline fn stackPushOne(self: *Runtime) Error!**StarObj {
+fn stackPushOne(self: *Runtime) Error!**StarObj {
     return self.stack.addOne(self.gc);
+}
+
+fn storeGlobal(self: *Runtime, name_idx: GlobalIdx, value: *StarObj) Error!void {
+    const frame = &self.frames.items[self.frames.items.len - 1];
+    const name = frame.func.names_free[@intFromEnum(name_idx)];
+    try self.globals.put(self.gc, name, value);
+}
+
+fn loadGlobal(self: *Runtime, name_idx: GlobalIdx) Error!*StarObj {
+    const frame = &self.frames.items[self.frames.items.len - 1];
+    const name = frame.func.names_free[@intFromEnum(name_idx)];
+    return self.globals.get(name) orelse return RuntimeError.UndefinedGlobal;
+}
+
+// Step until frame stack is empty
+pub fn stepUntilDone(self: *Runtime) Error!void {
+    while (self.frames.items.len > 0) {
+        try self.step();
+    }
 }
 
 // Move interpreter forward one step.
@@ -163,7 +186,7 @@ pub fn step(self: *Runtime) Error!void {
             const val = try self.stackPop();
             try frame.writeLocal(idx, val);
         },
-        .store_global => |_| @panic("not implemented"),
+        .store_global => |idx| try self.storeGlobal(idx, try self.stackPop()),
         .binary_op => |op| {
             const rhs = try self.stackPop();
             const lhs = try self.stackPop();
@@ -194,7 +217,7 @@ pub fn step(self: *Runtime) Error!void {
             };
 
             if (maybe_func) |fptr| {
-                try self.call_fn(fptr, args_slice);
+                try self.callFn(fptr, args_slice);
             } else {
                 return RuntimeError.CallUndefined;
             }
@@ -233,6 +256,25 @@ fn scopedLookup(self: *Runtime, idx: FreeVarIdx) Error!?*StarObj {
         }
     }
     return null;
+}
+
+pub fn execModule(self: *Runtime, module: *const Compiler.Module) !void {
+    const mod = try loadModule(module);
+
+    try self.callFn(&mod.init_fn, &.{});
+    try self.stepUntilDone();
+}
+
+fn loadModule(module: *const Compiler.Module) !*StarModule {
+    const mod = try StarModule.init(module.module_name, .{
+        .code = module.code,
+        .consts = module.constants,
+        .arity = 0,
+        .frame_size = 0,
+        .names_local = &.{},
+        .names_free = module.names,
+    });
+    return mod;
 }
 
 pub const StarInt = struct {
@@ -362,16 +404,24 @@ pub const StarNone = struct {
 };
 
 pub const StarModule = struct {
+    name: []const u8,
+    init_fn: StarFunc,
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
         },
     },
 
-    pub fn init() !*StarModule {
+    pub fn init(
+        name: []const u8,
+        init_fn: StarFunc,
+    ) !*StarModule {
         const alloc = Gc.allocator();
         const self = try alloc.create(StarModule);
-        self.* = .{};
+        self.* = .{
+            .name = name,
+            .init_fn = init_fn,
+        };
         return self;
     }
 };
@@ -447,12 +497,9 @@ test "Runtime executes add function" {
     defer rt.deinit();
 
     var empty_args: [0]*StarObj = .{};
-    try rt.call_fn(&func, empty_args[0..]);
+    try rt.callFn(&func, empty_args[0..]);
 
-    // Step until frame stack is empty
-    while (rt.frames.items.len > 0) {
-        try rt.step();
-    }
+    try rt.stepUntilDone();
 
     // At the end, top of stack should be the result
     try std.testing.expectEqual(1, rt.stack.items.len);
@@ -511,7 +558,7 @@ test "Runtime detects wrong arity" {
     defer rt.deinit();
 
     var no_args: [0]*StarObj = .{};
-    try std.testing.expectError(RuntimeError.WrongArity, rt.call_fn(&func, no_args[0..]));
+    try std.testing.expectError(RuntimeError.WrongArity, rt.callFn(&func, no_args[0..]));
 }
 
 test "Instruction.load_const out of range" {
@@ -531,7 +578,7 @@ test "Instruction.load_const out of range" {
     defer rt.deinit();
 
     var no_args: [0]*StarObj = .{};
-    try rt.call_fn(&func, no_args[0..]);
+    try rt.callFn(&func, no_args[0..]);
 
     try std.testing.expectError(RuntimeError.ConstOutOfRange, rt.step());
 }
@@ -564,11 +611,8 @@ test "Instruction.store and load locals" {
     defer rt.deinit();
 
     var no_args: [0]*StarObj = .{};
-    try rt.call_fn(&func, no_args[0..]);
-
-    while (rt.frames.items.len > 0) {
-        try rt.step();
-    }
+    try rt.callFn(&func, no_args[0..]);
+    try rt.stepUntilDone();
 
     const result_obj = rt.stack.items[0];
     const result = try downCast(StarInt, result_obj);
@@ -595,7 +639,7 @@ test "Instruction.call fails on non-function" {
     defer rt.deinit();
 
     var no_args: [0]*StarObj = .{};
-    try rt.call_fn(&func, no_args[0..]);
+    try rt.callFn(&func, no_args[0..]);
 
     // push the const onto stack manually
     try rt.stackPush(&fake_func_obj.obj);

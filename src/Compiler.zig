@@ -17,6 +17,7 @@ pub const Error = error{
 } || std.mem.Allocator.Error;
 
 pub const Module = struct {
+    module_name: []const u8,
     code: []Runtime.Instruction,
     constants: []*Runtime.StarObj,
     names: [][]const u8,
@@ -98,6 +99,7 @@ fn reverseArray(T: type, arr: []T) void {
 /// Iteratively evaluate nodes in topo order
 fn compileInOrder(
     gpa: std.mem.Allocator,
+    module_name: []const u8,
     source: [:0]const u8,
     ast: *const Ast,
     node_order: []const u32,
@@ -119,7 +121,7 @@ fn compileInOrder(
         names: std.ArrayList([]const u8) = .empty,
 
         // Ephemeral data
-        name_to_idx: std.StringHashMap(Runtime.NameIdx),
+        name_to_idx: std.StringHashMap(Runtime.GlobalIdx),
 
         pub fn emit(self: *@This(), instruction: Runtime.Instruction) Allocator.Error!void {
             try self.code.append(self.gc, instruction);
@@ -131,9 +133,9 @@ fn compileInOrder(
             return @enumFromInt(idx);
         }
 
-        pub fn defineName(self: *@This(), name: []const u8) Allocator.Error!Runtime.NameIdx {
+        pub fn defineName(self: *@This(), name: []const u8) Allocator.Error!Runtime.GlobalIdx {
             if (self.name_to_idx.get(name)) |v| return v;
-            const idx: Runtime.NameIdx = @enumFromInt(self.names.items.len);
+            const idx: Runtime.GlobalIdx = @enumFromInt(self.names.items.len);
             try self.names.append(self.gc, name);
             try self.name_to_idx.put(name, idx);
             return idx;
@@ -194,13 +196,17 @@ fn compileInOrder(
             .block => {
                 try module.emit(.ret);
             },
-            else => @panic("unsupported AST node"),
+            else => |t| {
+                const tag = std.meta.activeTag(t);
+                std.debug.panic("Unsupported AST node: {t}", .{tag});
+            },
         }
 
         // results[node_idx] = value;
     }
 
     return Module{
+        .module_name = module_name,
         .code = try module.code.toOwnedSlice(gc),
         .constants = try module.constants.toOwnedSlice(gc),
         .names = try module.names.toOwnedSlice(gc),
@@ -211,7 +217,7 @@ pub const Opts = struct {
     stack_depth: usize = 4096,
 };
 
-pub fn compile(fallback: Allocator, source: [:0]const u8, ast: *const Ast, comptime opts: Opts) Error!Module {
+pub fn compile(fallback: Allocator, module_name: []const u8, source: [:0]const u8, ast: *const Ast, comptime opts: Opts) Error!Module {
     if (ast.nodes.len == 0) return error.AstEmpty;
 
     var stack_fallback = std.heap.stackFallback(opts.stack_depth, fallback);
@@ -219,7 +225,7 @@ pub fn compile(fallback: Allocator, source: [:0]const u8, ast: *const Ast, compt
     const order = try topoSort(gpa, ast);
     defer gpa.free(order);
 
-    return try compileInOrder(gpa, source, ast, order);
+    return try compileInOrder(gpa, module_name, source, ast, order);
 }
 
 test compile {
@@ -229,7 +235,7 @@ test compile {
     var ast = try Ast.parse(std.testing.allocator, source);
     defer ast.deinit();
 
-    const module = try compile(std.testing.allocator, source, &ast, .{
+    const module = try compile(std.testing.allocator, "<test>", source, &ast, .{
         .stack_depth = 0, // Set to 0 to force usage of the fallback allocator and detect leaks.
     });
 
