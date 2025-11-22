@@ -6,14 +6,21 @@ const Token = Tokenizer.Token;
 const Ast = @import("Ast.zig");
 const Gc = @import("zig_libgc");
 
+const scope = .runtime;
+const log = std.log.scoped(scope);
+
 gpa: Allocator,
 gc: Allocator,
 /// Call stack for code/locals
-frames: std.ArrayList(Frame) = .empty,
+frames: std.SegmentedList(Frame, 4096) = .{},
 /// Value stack
 stack: std.ArrayList(*StarObj) = .empty,
 /// Globals
 globals: std.StringHashMapUnmanaged(*StarObj) = .empty,
+
+const knobs = struct {
+    const locals_initial_capacity: usize = 16;
+};
 
 pub const InitOpts = struct {};
 
@@ -25,16 +32,20 @@ pub const FreeVarIdx = enum(u32) { _ };
 
 pub const Arity = u32;
 
-pub const BinOp = enum { add };
+pub const BinOp = enum { add, sub, mul };
 
 pub const Instruction = union(enum) {
     load: LocalIdx,
     load_const: ConstIdx,
+    load_global: GlobalIdx,
+    load_free: FreeVarIdx,
     store: LocalIdx,
     store_global: GlobalIdx,
     binary_op: BinOp,
     call: Arity,
     ret: void,
+    ret_none: void,
+    make_closure: ConstIdx,
 
     const Tag = std.meta.Tag(@This());
 };
@@ -45,24 +56,27 @@ pub const TypeError = error{
 
 pub const RuntimeError = error{
     AddOpUndefined,
-    WrongArity,
+    SubOpUndefined,
+    MulOpUndefined,
+    ArityMismatch,
     LocalOutOfRange,
-    UninitializedLocal,
+    LocalUninitialized,
     ConstOutOfRange,
     StackUnderflow,
     CallUndefined,
-    NoFrame,
+    FrameMissing,
+    FrameNoReturn,
     ReturnedOutsideFunction,
     AttributeMissing,
+    GlobalUndefined,
+    FreeVarOutOfRange,
 };
 
-pub const Error = Allocator.Error || TypeError || RuntimeError;
+pub const Error = Allocator.Error || std.Io.Writer.Error || TypeError || RuntimeError;
 
 const Frame = struct {
     func: *StarFunc,
-    /// Segmented list, first 16 elements are stack allocated.
-    locals: std.SegmentedList(*StarObj, 16),
-    return_addr: **StarObj,
+    locals: std.SegmentedList(*StarObj, knobs.locals_initial_capacity),
     sp_base: usize,
     pc: usize, // pc inside this frame's code
 
@@ -84,6 +98,12 @@ const Frame = struct {
         const local = self.locals.at(local_idx).*;
         return local;
     }
+
+    pub fn readFree(self: *Frame, idx: FreeVarIdx) Error!*StarObj {
+        const free_idx = @intFromEnum(idx);
+        if (free_idx >= self.func.closure_cells.len) return RuntimeError.FreeVarOutOfRange;
+        return self.func.closure_cells[free_idx];
+    }
 };
 const Runtime = @This();
 
@@ -97,7 +117,8 @@ pub fn init(gpa: Allocator, opts: InitOpts) !Runtime {
 
 pub fn deinit(self: *Runtime) void {
     // free any frame locals still allocated
-    for (self.frames.items) |*frame| {
+    var frame_iter = self.frames.iterator(0);
+    while (frame_iter.next()) |frame| {
         frame.locals.deinit(self.gc);
     }
     self.frames.deinit(self.gc);
@@ -108,17 +129,25 @@ pub fn deinit(self: *Runtime) void {
 /// Create and push a new frame for `func`. Copies args into locals[0..arity).
 /// ret_addr is the caller's next-pc (an index into the caller's code).
 fn callFn(self: *Runtime, func: *StarFunc, args: []*StarObj) Error!void {
-    if (args.len != func.arity) return RuntimeError.WrongArity;
+    if (args.len != func.arity) return RuntimeError.ArityMismatch;
     std.debug.assert(func.frame_size >= func.arity);
 
-    const return_addr = try self.stackPushOne();
+    if (comptime std.log.logEnabled(.debug, scope)) {
+        log.debug("callFn: arity={d}, args=[", .{func.arity});
+        for (args, 0..) |arg, i| {
+            if (i > 0) log.debug(", ", .{});
+            log.debug("{s}", .{arg.vtable.name});
+        }
+        log.debug("]", .{});
+    }
 
-    // create frame value and push
+    const sp_base = self.stack.items.len;
+    log.debug("sp_base: {d}", .{sp_base});
+
     var frame = Frame{
         .func = func,
         .locals = .{},
-        .return_addr = return_addr,
-        .sp_base = self.stack.items.len,
+        .sp_base = sp_base,
         .pc = 0,
     };
     if (func.frame_size > 0) {
@@ -144,35 +173,41 @@ fn stackPushOne(self: *Runtime) Error!**StarObj {
 }
 
 fn storeGlobal(self: *Runtime, name_idx: GlobalIdx, value: *StarObj) Error!void {
-    const frame = &self.frames.items[self.frames.items.len - 1];
-    const name = frame.func.names_free[@intFromEnum(name_idx)];
+    const frame: *Frame = self.frames.at(self.frames.len - 1);
+    const name = frame.func.names_global[@intFromEnum(name_idx)];
     try self.globals.put(self.gc, name, value);
 }
 
 fn loadGlobal(self: *Runtime, name_idx: GlobalIdx) Error!*StarObj {
-    const frame = &self.frames.items[self.frames.items.len - 1];
-    const name = frame.func.names_free[@intFromEnum(name_idx)];
-    return self.globals.get(name) orelse return RuntimeError.UndefinedGlobal;
+    const frame: *Frame = self.frames.at(self.frames.len - 1);
+    const name = frame.func.names_global[@intFromEnum(name_idx)];
+    log.debug("Loading global: {s}", .{name});
+    return self.globals.get(name) orelse return RuntimeError.GlobalUndefined;
 }
 
 // Step until frame stack is empty
 pub fn stepUntilDone(self: *Runtime) Error!void {
-    while (self.frames.items.len > 0) {
+    while (self.frames.len > 0) {
         try self.step();
     }
 }
 
 // Move interpreter forward one step.
 pub fn step(self: *Runtime) Error!void {
-    if (self.frames.items.len == 0) return RuntimeError.NoFrame;
-    var frame = &self.frames.items[self.frames.items.len - 1];
+    if (self.frames.len == 0) return RuntimeError.FrameMissing;
+    var frame: *Frame = self.frames.at(self.frames.len - 1);
     const active_code = frame.func.code;
 
-    if (frame.pc >= active_code.len) return RuntimeError.NoFrame;
+    if (frame.pc >= active_code.len) return RuntimeError.FrameNoReturn;
 
     const instr = active_code[frame.pc];
+    const pc = frame.pc;
 
-    defer frame.pc += 1;
+    defer {
+        frame.pc += 1;
+    }
+
+    log.debug("[{d}] {s}", .{ pc, @tagName(instr) });
     switch (instr) {
         .load => |idx| {
             const val = try frame.readLocal(idx);
@@ -182,17 +217,30 @@ pub fn step(self: *Runtime) Error!void {
             const const_obj = try frame.readConst(cidx);
             try self.stackPush(const_obj);
         },
+        .load_global => |idx| {
+            const val = try self.loadGlobal(idx);
+            try self.stackPush(val);
+        },
+        .load_free => |idx| {
+            const val = try frame.readFree(idx);
+            try self.stackPush(val);
+        },
         .store => |idx| {
             const val = try self.stackPop();
             try frame.writeLocal(idx, val);
         },
-        .store_global => |idx| try self.storeGlobal(idx, try self.stackPop()),
+        .store_global => |idx| {
+            const val = try self.stackPop();
+            try self.storeGlobal(idx, val);
+        },
         .binary_op => |op| {
             const rhs = try self.stackPop();
             const lhs = try self.stackPop();
 
             const result: *StarObj = switch (op) {
                 .add => try lhs.addOp(rhs),
+                .sub => try lhs.subOp(rhs),
+                .mul => try lhs.mulOp(rhs),
             };
 
             try self.stackPush(result);
@@ -207,25 +255,92 @@ pub fn step(self: *Runtime) Error!void {
             const args_start = sp - arity;
             const func_index = args_start - 1;
             const func_obj = self.stack.items[func_index];
+            log.debug("=== Calling function, arity={d}, type={s} ===", .{ arity, func_obj.vtable.name });
 
             const args_slice: []*StarObj = self.stack.items[args_start .. args_start + arity];
 
             // Try interpreted function first: downCast StarFunc
-            const maybe_func = downCast(StarFunc, func_obj) catch |e| switch (e) {
+            const maybe_func: ?*StarFunc = downCast(StarFunc, func_obj) catch |e| switch (e) {
                 TypeError.TypeMismatch => null,
                 else => return e,
             };
 
             if (maybe_func) |fptr| {
-                try self.callFn(fptr, args_slice);
+                if (fptr.native_fn) |f| {
+                    try self.stackPush(try f(self, args_slice));
+                } else try self.callFn(fptr, args_slice);
             } else {
                 return RuntimeError.CallUndefined;
             }
         },
-        .ret => {
+        .make_closure => |cidx| {
+            log.debug("=== make_closure called, cidx={d}, frame.func.arity={d}, frame.func.names_local.len={d} ===", .{ @intFromEnum(cidx), frame.func.arity, frame.func.names_local.len });
+            for (frame.func.names_local, 0..) |name, idx| {
+                const val = try frame.readLocal(@enumFromInt(idx));
+                log.debug("  local[{d}] '{s}' = {s}", .{ idx, name, val.vtable.name });
+            }
+            // Get the base function from constants
+            const const_obj = try frame.readConst(cidx);
+            const base_func = try downCast(StarFunc, const_obj);
+
+            // Doesn't enclose over free variables.
+            if (base_func.names_free.len == 0) {
+                try self.stackPush(const_obj);
+                return;
+            }
+
+            // Allocate closure_cells array
+            const closure_cells = try self.gc.alloc(*StarObj, base_func.names_free.len);
+
+            // Populate closure_cells by looking up each free variable name in current scope
+            for (base_func.names_free, 0..) |name, i| {
+                var found = false;
+
+                for (frame.func.names_local, 0..) |local_name, local_idx| {
+                    if (std.mem.eql(u8, name, local_name)) {
+                        const captured = try frame.readLocal(@enumFromInt(local_idx));
+                        log.debug("Capturing '{s}' from local[{d}], type: {s}", .{ name, local_idx, captured.vtable.name });
+                        closure_cells[i] = captured;
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (!found) {
+                    for (frame.func.names_free, 0..) |free_name, free_idx| {
+                        if (std.mem.eql(u8, name, free_name)) {
+                            closure_cells[i] = try frame.readFree(@enumFromInt(free_idx));
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!found) {
+                    return RuntimeError.GlobalUndefined; // Should never happen if compiler is correct
+                }
+            }
+
+            // Create new function with captured cells
+            const closure_func = try self.gc.create(StarFunc);
+            closure_func.* = .{
+                .code = base_func.code,
+                .consts = base_func.consts,
+                .arity = base_func.arity,
+                .frame_size = base_func.frame_size,
+                .names_local = base_func.names_local,
+                .names_free = base_func.names_free,
+                .closure_cells = closure_cells,
+            };
+
+            try self.stackPush(&closure_func.obj);
+        },
+        .ret, .ret_none => {
             var frame_val = self.frames.pop() orelse return error.ReturnedOutsideFunction;
             frame_val.locals.deinit(self.gpa);
-            const return_value = try self.stackPop();
+            const return_value =
+                if (std.meta.activeTag(instr) == .ret) try self.stackPop() else StarNone.instance;
+            log.debug("ret: returning {s}", .{return_value.vtable.name});
             // Pop args, and function reference.
             const new_sp = frame_val.sp_base - frame_val.func.arity - 1;
             std.debug.assert(new_sp >= 0);
@@ -239,7 +354,7 @@ pub fn step(self: *Runtime) Error!void {
 /// cannot be known ahead of time.
 fn scopedLookup(self: *Runtime, idx: FreeVarIdx) Error!?*StarObj {
     const free_idx: usize = @intFromEnum(idx);
-    if (self.frames.items.len == 0) return error.NoFrame;
+    if (self.frames.items.len == 0) return error.FrameMissing;
     const current = self.frames.items[self.frames.items.len - 1];
     const func = current.func;
     const name = func.names[free_idx];
@@ -258,23 +373,21 @@ fn scopedLookup(self: *Runtime, idx: FreeVarIdx) Error!?*StarObj {
     return null;
 }
 
-pub fn execModule(self: *Runtime, module: *const Compiler.Module) !void {
-    const mod = try loadModule(module);
-
-    try self.callFn(&mod.init_fn, &.{});
-    try self.stepUntilDone();
+pub fn takeOwnedGlobals(self: *Runtime) std.StringHashMapUnmanaged(*StarObj) {
+    const old_globals = self.globals;
+    self.globals = std.StringHashMapUnmanaged(*StarObj).empty;
+    return old_globals;
 }
 
-fn loadModule(module: *const Compiler.Module) !*StarModule {
-    const mod = try StarModule.init(module.module_name, .{
-        .code = module.code,
-        .consts = module.constants,
-        .arity = 0,
-        .frame_size = 0,
-        .names_local = &.{},
-        .names_free = module.names,
-    });
-    return mod;
+pub fn execModule(self: *Runtime, module: *const Compiler.Module) !void {
+    const mod = try StarModule.fromCompiledModule(module);
+
+    std.debug.assert(mod.init_fn.arity == 0);
+    try self.stackPush(&mod.init_fn.obj);
+    try self.callFn(&mod.init_fn, &.{});
+    try self.stepUntilDone();
+    // Module inits return None
+    _ = try self.stackPop();
 }
 
 pub const StarInt = struct {
@@ -283,6 +396,9 @@ pub const StarInt = struct {
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
             .add_op = &add_op,
+            .sub_op = &sub_op,
+            .mul_op = &mul_op,
+            .str = &str,
         },
     },
 
@@ -302,6 +418,37 @@ pub const StarInt = struct {
         const new = try StarInt.init(self_int.num + o.num);
         return &new.obj;
     }
+
+    fn sub_op(vt: *StarObj.Vtable, other: *StarObj) Error!*StarObj {
+        const owner_starobj = vt.basePtr();
+        const self_int: *StarInt = @fieldParentPtr("obj", owner_starobj);
+
+        const o = try downCast(StarInt, other);
+
+        const new = try StarInt.init(self_int.num - o.num);
+        return &new.obj;
+    }
+
+    fn mul_op(vt: *StarObj.Vtable, other: *StarObj) Error!*StarObj {
+        const owner_starobj = vt.basePtr();
+        const self_int: *StarInt = @fieldParentPtr("obj", owner_starobj);
+
+        const o = try downCast(StarInt, other);
+
+        const new = try StarInt.init(self_int.num * o.num);
+        return &new.obj;
+    }
+
+    fn str(vt: *StarObj.Vtable) Error!*StarObj {
+        const owner_starobj = vt.basePtr();
+        const self_int: *StarInt = @fieldParentPtr("obj", owner_starobj);
+
+        const allocator = Gc.allocator();
+        const str_val = try std.fmt.allocPrint(allocator, "{d}", .{self_int.num});
+        const new = try allocator.create(StarStr);
+        new.* = .{ .str = str_val };
+        return &new.obj;
+    }
 };
 
 pub const StarFloat = struct {
@@ -310,6 +457,9 @@ pub const StarFloat = struct {
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
             .add_op = &add_op,
+            .sub_op = &sub_op,
+            .mul_op = &mul_op,
+            .str = &str,
         },
     },
 
@@ -329,6 +479,37 @@ pub const StarFloat = struct {
         const new = try StarFloat.init(self_int.num + o.num);
         return &new.obj;
     }
+
+    fn sub_op(vt: *StarObj.Vtable, other: *StarObj) Error!*StarObj {
+        const owner_starobj = vt.basePtr();
+        const self_float: *StarFloat = @fieldParentPtr("obj", owner_starobj);
+
+        const o = try downCast(StarFloat, other);
+
+        const new = try StarFloat.init(self_float.num - o.num);
+        return &new.obj;
+    }
+
+    fn mul_op(vt: *StarObj.Vtable, other: *StarObj) Error!*StarObj {
+        const owner_starobj = vt.basePtr();
+        const self_float: *StarFloat = @fieldParentPtr("obj", owner_starobj);
+
+        const o = try downCast(StarFloat, other);
+
+        const new = try StarFloat.init(self_float.num * o.num);
+        return &new.obj;
+    }
+
+    fn str(vt: *StarObj.Vtable) Error!*StarObj {
+        const owner_starobj = vt.basePtr();
+        const self_float: *StarFloat = @fieldParentPtr("obj", owner_starobj);
+
+        const allocator = Gc.allocator();
+        const str_val = try std.fmt.allocPrint(allocator, "{d}", .{self_float.num});
+        const new = try allocator.create(StarStr);
+        new.* = .{ .str = str_val };
+        return &new.obj;
+    }
 };
 
 pub const StarStr = struct {
@@ -336,6 +517,7 @@ pub const StarStr = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
+            .str = &str_fn,
         },
     },
 
@@ -344,6 +526,11 @@ pub const StarStr = struct {
         const self = try allocator.create(StarStr);
         self.* = .{ .str = try allocator.dupe(u8, str) };
         return self;
+    }
+
+    fn str_fn(vt: *StarObj.Vtable) Error!*StarObj {
+        const owner_starobj = vt.basePtr();
+        return owner_starobj;
     }
 };
 
@@ -374,33 +561,155 @@ pub fn downCast(T: type, obj: *StarObj) TypeError!*T {
     return @fieldParentPtr("obj", obj);
 }
 
+pub fn starTypeToZig(T: type) type {
+    switch (T) {
+        StarInt => return u64,
+        StarFloat => return f64,
+        StarStr => return []const u8,
+        else => @compileError("Unsupported type " ++ @typeName(T)),
+    }
+}
+
+pub fn zigToStarType(T: type) type {
+    switch (@typeInfo(T)) {
+        .int => return StarInt,
+        .float => return StarFloat,
+        .pointer => |p| {
+            if (p.size == .slice and p.child == u8) {
+                return StarStr;
+            } else @compileError("Pointers are only allowed with string slices.");
+        },
+        else => @compileError("Unsupported type " ++ @typeName(T)),
+    }
+}
+
+pub fn unwrapStar(T: type, value: *T) starTypeToZig(T) {
+    // const value_typeinfo = @typeInfo(value);
+    // const T = blk: switch (value_typeinfo) {
+    //     .pointer => |p| break :blk p.child,
+    //     else => @compileError("Expected a pointer."),
+    // };
+    return switch (T) {
+        StarInt => value.num,
+        StarFloat => value.num,
+        StarStr => value.str,
+        else => @compileError("Unsupported type " ++ @typeName(T)),
+    };
+}
+
 pub const StarFunc = struct {
-    code: []const Instruction,
-    consts: []const *StarObj, // function constants (literals, etc.)
+    code: []const Instruction = &.{},
     arity: usize,
     /// number of local slots
     frame_size: usize,
+    /// function constants (literals, etc.)
+    consts: []const *StarObj = &.{},
     /// All local var names
-    names_local: []const []const u8,
+    names_local: []const []const u8 = &.{},
     /// All free var names
-    names_free: []const []const u8,
+    names_free: []const []const u8 = &.{},
+    /// All global var names referenced by this function
+    names_global: []const []const u8 = &.{},
+    /// Closure cells (captured variables)
+    closure_cells: []const *StarObj = &.{},
+
+    native_fn: ?*const fn (rt: *Runtime, args: []*StarObj) Error!*StarObj = null,
 
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
+            .str = &str,
         },
     },
+
+    fn str(vt: *StarObj.Vtable) Error!*StarObj {
+        _ = vt;
+        return &func_str.obj;
+    }
+
+    var func_str = StarStr{ .str = "<function>" };
+
+    pub fn fromNative(
+        // TODO: kwargs
+        Args: type,
+        comptime native: fn (rt: *Runtime, args: Args) Error!?*StarObj,
+    ) StarFunc {
+        // Handle variadic args: []*StarObj
+        if (Args == []*StarObj) {
+            const native_fn = struct {
+                pub fn wrapper(rt: *Runtime, args: []*StarObj) Error!*StarObj {
+                    const res = try native(rt, args);
+                    if (res) |r| return r;
+                    return StarNone.instance;
+                }
+            }.wrapper;
+            return StarFunc{
+                .native_fn = &native_fn,
+                .arity = 0, // variadic
+                .frame_size = 0,
+            };
+        }
+
+        const args_typeinfo = @typeInfo(Args);
+        switch (args_typeinfo) {
+            .@"struct" => |s| {
+                const arity = s.fields.len;
+                const native_fn = struct {
+                    pub fn wrapper(rt: *Runtime, args: []*StarObj) Error!*StarObj {
+                        var parsed_args: Args = undefined;
+                        if (args.len != arity) return Error.ArityMismatch;
+                        inline for (s.fields, 0..) |field, i| {
+                            const StarType = comptime zigToStarType(field.type);
+                            const downcasted: *StarType = try downCast(StarType, args[i]);
+                            @field(parsed_args, field.name) = unwrapStar(StarType, downcasted);
+                        }
+                        const res = try native(rt, parsed_args);
+
+                        if (res) |r| return r;
+                        return StarNone.instance;
+                    }
+                }.wrapper;
+                return StarFunc{
+                    .native_fn = &native_fn,
+                    .arity = arity,
+                    .frame_size = arity,
+                };
+            },
+            else => @compileError("Expected struct but got " ++ @typeName(Args)),
+        }
+    }
+
+    test "Native function" {
+        const Args = struct {
+            x: u64,
+            y: u64,
+        };
+        _ = fromNative(Args, struct {
+            pub fn inner(_: *Runtime, args: Args) Error!?*StarObj {
+                _ = args.x + args.y;
+                return null;
+            }
+        }.inner);
+    }
 };
 
 pub const StarNone = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
+            .str = &str,
         },
     },
 
+    fn str(vt: *StarObj.Vtable) Error!*StarObj {
+        _ = vt;
+        return &none_str.obj;
+    }
+
     var none_obj = StarNone{};
     pub const instance: *StarObj = &none_obj.obj;
+
+    var none_str = StarStr{ .str = "None" };
 };
 
 pub const StarModule = struct {
@@ -409,8 +718,20 @@ pub const StarModule = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
+            .str = &str,
         },
     },
+
+    fn str(vt: *StarObj.Vtable) Error!*StarObj {
+        const owner_starobj = vt.basePtr();
+        const self_module: *StarModule = @fieldParentPtr("obj", owner_starobj);
+
+        const allocator = Gc.allocator();
+        const str_val = try std.fmt.allocPrint(allocator, "<module '{s}'>", .{self_module.name});
+        const new = try allocator.create(StarStr);
+        new.* = .{ .str = str_val };
+        return &new.obj;
+    }
 
     pub fn init(
         name: []const u8,
@@ -424,6 +745,19 @@ pub const StarModule = struct {
         };
         return self;
     }
+
+    fn fromCompiledModule(module: *const Compiler.Module) !*StarModule {
+        const mod = try StarModule.init(module.module_name, .{
+            .code = module.code,
+            .consts = module.constants,
+            .arity = 0,
+            .frame_size = 0,
+            .names_local = &.{},
+            .names_free = &.{},
+            .names_global = module.global_names,
+        });
+        return mod;
+    }
 };
 
 pub const StarObj = struct {
@@ -434,6 +768,12 @@ pub const StarObj = struct {
         name: []const u8,
         // optional add operator
         add_op: ?*const fn (*Vtable, other: *StarObj) Error!*StarObj = null,
+        // optional sub operator
+        sub_op: ?*const fn (*Vtable, other: *StarObj) Error!*StarObj = null,
+        // optional mul operator
+        mul_op: ?*const fn (*Vtable, other: *StarObj) Error!*StarObj = null,
+        // optional str method for string representation
+        str: ?*const fn (*Vtable) Error!*StarObj = null,
 
         pub fn basePtr(self: *Vtable) *StarObj {
             return @fieldParentPtr("vtable", self);
@@ -466,7 +806,65 @@ pub const StarObj = struct {
         }
         return RuntimeError.AddOpUndefined;
     }
+
+    pub fn subOp(self: *StarObj, other: *StarObj) Error!*StarObj {
+        if (self.vtable.sub_op) |f| {
+            return try f(&self.vtable, other);
+        }
+        return RuntimeError.SubOpUndefined;
+    }
+
+    pub fn mulOp(self: *StarObj, other: *StarObj) Error!*StarObj {
+        if (self.vtable.mul_op) |f| {
+            return try f(&self.vtable, other);
+        }
+        return RuntimeError.MulOpUndefined;
+    }
 };
+
+/// Registers all functions from a wrapped stdlib struct into runtime globals.
+pub fn registerStdlib(self: *Runtime, T: type) Error!void {
+    const decls = @typeInfo(T.Underlying).@"struct".decls;
+
+    // Not a range so we can increment only when we hit functions.
+    var i: usize = 0;
+    inline for (decls) |decl| {
+        const DeclType = @TypeOf(@field(T.Underlying, decl.name));
+        if (@typeInfo(DeclType) == .@"fn") {
+            const func = @field(T.Underlying, decl.name);
+            const func_info = @typeInfo(DeclType).@"fn";
+
+            // Extract Args type from first parameter
+            if (func_info.params.len != 2) {
+                @compileError("Native functions must take exactly two parameters (runtime, args struct)");
+            }
+            const ArgsType = func_info.params[1].type.?;
+
+            T.fns_buffer[i] = StarFunc.fromNative(ArgsType, func);
+            try self.globals.put(self.gc, decl.name, &T.fns_buffer[i].obj);
+            i += 1;
+        }
+    }
+}
+
+fn numFuncs(T: type) comptime_int {
+    comptime var field_count = 0;
+    inline for (std.meta.declarations(T)) |decl| {
+        const DeclType = @TypeOf(@field(T, decl.name));
+        if (@typeInfo(DeclType) == .@"fn") {
+            field_count += 1;
+        }
+    }
+    return field_count;
+}
+
+pub fn StarNativeModule(T: type) type {
+    return struct {
+        const Underlying = T;
+        /// Statically defined buffer for global functions.
+        var fns_buffer: [numFuncs(T)]StarFunc = undefined;
+    };
+}
 
 test "Runtime executes add function" {
     const gpa = std.testing.allocator;
@@ -497,6 +895,7 @@ test "Runtime executes add function" {
     defer rt.deinit();
 
     var empty_args: [0]*StarObj = .{};
+    try rt.stackPush(&func.obj);
     try rt.callFn(&func, empty_args[0..]);
 
     try rt.stepUntilDone();
@@ -558,7 +957,8 @@ test "Runtime detects wrong arity" {
     defer rt.deinit();
 
     var no_args: [0]*StarObj = .{};
-    try std.testing.expectError(RuntimeError.WrongArity, rt.callFn(&func, no_args[0..]));
+    try rt.stackPush(&func.obj);
+    try std.testing.expectError(RuntimeError.ArityMismatch, rt.callFn(&func, no_args[0..]));
 }
 
 test "Instruction.load_const out of range" {
@@ -578,6 +978,7 @@ test "Instruction.load_const out of range" {
     defer rt.deinit();
 
     var no_args: [0]*StarObj = .{};
+    try rt.stackPush(&func.obj);
     try rt.callFn(&func, no_args[0..]);
 
     try std.testing.expectError(RuntimeError.ConstOutOfRange, rt.step());
@@ -611,6 +1012,7 @@ test "Instruction.store and load locals" {
     defer rt.deinit();
 
     var no_args: [0]*StarObj = .{};
+    try rt.stackPush(&func.obj);
     try rt.callFn(&func, no_args[0..]);
     try rt.stepUntilDone();
 
@@ -639,10 +1041,80 @@ test "Instruction.call fails on non-function" {
     defer rt.deinit();
 
     var no_args: [0]*StarObj = .{};
+    try rt.stackPush(&func.obj);
     try rt.callFn(&func, no_args[0..]);
 
     // push the const onto stack manually
     try rt.stackPush(&fake_func_obj.obj);
 
     try std.testing.expectError(RuntimeError.CallUndefined, rt.step());
+}
+
+test "Nested functions and closures" {
+    const compile = Compiler.compile;
+
+    const source: [:0]const u8 =
+        \\def make_getter(n):
+        \\  def getter():
+        \\    return n
+        \\  return getter
+        \\f = make_getter(42)
+        \\result = f()
+    ;
+
+    var ast = try Ast.parse(std.testing.allocator, source);
+    defer ast.deinit();
+
+    const module = try compile(std.testing.allocator, "<test>", source, &ast, .{});
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    try rt.execModule(&module);
+
+    const f_val = rt.globals.get("f") orelse return error.TestUnexpectedResult;
+    const f_func = try Runtime.downCast(Runtime.StarFunc, f_val);
+
+    // `f` enclosed `n` on upon definition
+    try std.testing.expectEqual(1, f_func.closure_cells.len);
+
+    const captured_obj = f_func.closure_cells[0];
+    const captured_val = try Runtime.downCast(Runtime.StarInt, captured_obj);
+    try std.testing.expectEqual(@as(u64, 42), captured_val.num);
+
+    const result_val = rt.globals.get("result") orelse return error.TestUnexpectedResult;
+    const result_int = try Runtime.downCast(Runtime.StarInt, result_val);
+    try std.testing.expectEqual(@as(u64, 42), result_int.num);
+
+    try std.testing.expectEqual(0, rt.stack.items.len);
+}
+
+test "registerStdlib populates runtime globals" {
+    const gpa = std.testing.allocator;
+
+    const Builtins = StarNativeModule(struct {
+        pub fn print(_: *Runtime, args: struct { msg: []const u8 }) Error!?*StarObj {
+            std.debug.print("Message: {s}\n", .{args.msg});
+            return null;
+        }
+
+        pub fn square(_: *Runtime, args: struct { n: u64 }) Error!?*StarObj {
+            _ = args.n * args.n;
+            return null;
+        }
+    });
+
+    var rt = try Runtime.init(gpa, .{});
+    defer rt.deinit();
+
+    try rt.registerStdlib(Builtins);
+
+    const print_global = rt.globals.get("print");
+    try std.testing.expect(print_global != null);
+    const print_func = try downCast(StarFunc, print_global.?);
+    try std.testing.expectEqual(@as(usize, 1), print_func.arity);
+
+    const square_global = rt.globals.get("square");
+    try std.testing.expect(square_global != null);
+    const square_func = try downCast(StarFunc, square_global.?);
+    try std.testing.expectEqual(@as(usize, 1), square_func.arity);
 }

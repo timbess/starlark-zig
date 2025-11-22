@@ -47,6 +47,7 @@ pub const Error = struct {
 
     pub const Tag = enum {
         expected_expr,
+        expected_operator,
         expected_fn_arg,
         unexpected_eof,
     };
@@ -58,7 +59,7 @@ pub const Node = struct {
 
     pub const Index = enum(u32) { none = std.math.maxInt(u32), _ };
 
-    const Tag = enum {
+    pub const Tag = enum {
         block,
         var_definition,
         def_proto,
@@ -67,6 +68,13 @@ pub const Node = struct {
         literal,
         @"return",
         identifier,
+        call,
+        call_args,
+        bool_and,
+        bool_or,
+        add,
+        sub,
+        mul,
     };
 
     pub const Data = union(Tag) {
@@ -91,8 +99,22 @@ pub const Node = struct {
         literal: void, // Use token
         @"return": Node.Index,
         identifier: void,
+        call: struct {
+            func: Node.Index,
+            args: Node.Index,
+        },
+        call_args: struct {
+            args: []const Node.Index,
+        },
+        bool_and: BinOp,
+        bool_or: BinOp,
+        add: BinOp,
+        sub: BinOp,
+        mul: BinOp,
     };
 };
+
+pub const BinOp = struct { lhs: Node.Index, rhs: Node.Index };
 
 pub const DebugNodeFormatter = std.fmt.Formatter(*const Ast, struct {
     pub fn format(
@@ -201,6 +223,45 @@ pub const DebugNodeFormatter = std.fmt.Formatter(*const Ast, struct {
                         },
                         .identifier => {
                             try stack.appendBounded(.{ .idx = frame.idx, .state = .close_node, .indent = frame.indent });
+                        },
+                        .call => |c| {
+                            try writer.print(", func=\n", .{});
+
+                            try stack.appendBounded(.{ .idx = frame.idx, .state = .close_node, .indent = frame.indent });
+
+                            // Push args node
+                            try stack.appendBounded(.{ .idx = c.args, .state = .start, .indent = frame.indent + 1 });
+
+                            // Print args label
+                            for (0..frame.indent) |_| _ = try writer.write("  ");
+                            try writer.print(", args=\n", .{});
+
+                            // Push func
+                            try stack.appendBounded(.{ .idx = c.func, .state = .start, .indent = frame.indent + 1 });
+                        },
+                        .call_args => |ca| {
+                            try writer.print(", args=[\n", .{});
+
+                            try stack.appendBounded(.{ .idx = frame.idx, .state = .close_node, .indent = frame.indent });
+                            try stack.appendBounded(.{ .idx = frame.idx, .state = .close_array, .indent = frame.indent + 1 });
+
+                            if (ca.args.len > 0) {
+                                for (ca.args, 0..) |_, i| {
+                                    const rev = ca.args.len - 1 - i;
+                                    try stack.appendBounded(.{ .idx = ca.args[rev], .state = .start, .indent = frame.indent + 1 });
+                                }
+                            }
+                        },
+                        .bool_and, .bool_or, .add, .sub => |binop| {
+                            try writer.print(", lhs=\n", .{});
+
+                            try stack.appendBounded(.{ .idx = frame.idx, .state = .close_node, .indent = frame.indent });
+                            try stack.appendBounded(.{ .idx = binop.rhs, .state = .start, .indent = frame.indent + 1 });
+
+                            for (0..frame.indent) |_| _ = try writer.write("  ");
+                            try writer.print(", rhs=\n", .{});
+
+                            try stack.appendBounded(.{ .idx = binop.lhs, .state = .start, .indent = frame.indent + 1 });
                         },
                     }
                 },
