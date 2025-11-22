@@ -14,6 +14,9 @@ const State = enum {
     invalid,
     number,
     number_w_decimal,
+    string,
+    string_escape_char,
+    operator_two_char,
 
     const initial_state: State = .start;
 };
@@ -38,9 +41,16 @@ pub const Token = struct {
         block_end,
         keyword_def,
         keyword_return,
+        keyword_and,
+        keyword_or,
         colon,
         star,
         starstar,
+        minus,
+        minus_eq,
+        plus,
+        plus_eq,
+        dot,
     };
 
     pub const Loc = struct {
@@ -51,6 +61,8 @@ pub const Token = struct {
     const keywords = std.StaticStringMap(Tag).initComptime(.{
         .{ "def", .keyword_def },
         .{ "return", .keyword_return },
+        .{ "and", .keyword_and },
+        .{ "or", .keyword_or },
     });
 
     pub fn getKeyword(name: []const u8) ?Tag {
@@ -117,12 +129,38 @@ pub fn next(self: *Tokenizer) Error!Token {
                     self.index += 1;
                     result.tag = .eq;
                 },
+                '*' => {
+                    self.index += 1;
+                    result.tag = .star;
+                    continue :state .operator_two_char;
+                },
+                '+' => {
+                    self.index += 1;
+                    result.tag = .plus;
+                    continue :state .operator_two_char;
+                },
+                '-' => {
+                    self.index += 1;
+                    result.tag = .minus;
+                    continue :state .operator_two_char;
+                },
                 '0'...'9' => {
                     continue :state .number;
                 },
                 'a'...'z', 'A'...'Z', '_' => {
                     self.index += 1;
                     continue :state .identifier;
+                },
+                '.' => {
+                    self.index += 1;
+                    result.tag = .dot;
+                },
+                ',' => {
+                    self.index += 1;
+                    result.tag = .comma;
+                },
+                '"' => {
+                    continue :state .string;
                 },
                 '(' => {
                     self.index += 1;
@@ -209,6 +247,64 @@ pub fn next(self: *Tokenizer) Error!Token {
                 },
                 else => {
                     result.tag = .number_literal;
+                },
+            }
+        },
+        .string => {
+            self.index += 1;
+            switch (self.source[self.index]) {
+                0 => {
+                    if (self.index != self.source.len) {
+                        continue :state .invalid;
+                    } else {
+                        result.tag = .invalid;
+                    }
+                },
+                '\n' => result.tag = .invalid,
+                '\\' => continue :state .string_escape_char,
+                '"' => {
+                    self.index += 1;
+                    result.tag = .string;
+                },
+                // Control characters are not allowed in strings.
+                0x01...0x09, 0x0b...0x1f, 0x7f => {
+                    continue :state .invalid;
+                },
+                else => continue :state .string,
+            }
+        },
+        .string_escape_char => {
+            // Ignore whatever comes next and parse it later.
+            self.index += 1;
+            switch (self.source[self.index]) {
+                0, '\n' => result.tag = .invalid,
+                else => continue :state .string,
+            }
+        },
+        .operator_two_char => {
+            switch (self.source[self.index]) {
+                0 => {
+                    if (self.index != self.source.len) {
+                        continue :state .invalid;
+                    } else {
+                        result.tag = .invalid;
+                    }
+                },
+                '*' => {
+                    if (result.tag != .star) continue :state .invalid;
+                    self.index += 1;
+                    result.tag = .starstar;
+                },
+                '=' => {
+                    switch (result.tag) {
+                        .minus => result.tag = .minus_eq,
+                        .plus => result.tag = .plus_eq,
+                        else => continue :state .invalid,
+                    }
+                    self.index += 1;
+                },
+                else => {
+                    // Not a two-char operator, return the single-char operator token
                 },
             }
         },

@@ -34,6 +34,12 @@ pub fn build(b: *std.Build) void {
     const install_exe = b.addInstallArtifact(exe, .{});
     b.getInstallStep().dependOn(&install_exe.step);
 
+    const run_test_star = b.addRunArtifact(exe);
+    run_test_star.addFileArg(b.path("./test.star"));
+    run_test_star.step.addWatchInput(b.path("./test.star")) catch @panic("OOM");
+    const run_test_star_step = b.step("run-test-star", "Runs test.star in root");
+    run_test_star_step.dependOn(&run_test_star.step);
+
     const run = b.step("run", "Executes starlark binary");
     run.dependOn(&b.addRunArtifact(exe).step);
 

@@ -19,7 +19,8 @@ scratch: std.ArrayList(Node.Index) = .empty,
 errors: std.ArrayList(Ast.Error) = .empty,
 token_idx: u32 = 0,
 
-const log = std.log.scoped(.parser);
+const scope = .parser;
+const log = std.log.scoped(scope);
 
 const SIZING_FACTOR = 1 / 8;
 
@@ -31,7 +32,11 @@ pub fn init(gpa: Allocator, tokenizer: *Tokenizer) !Parser {
     errdefer tokens.deinit(gpa);
 
     while (tokenizer.next()) |t| {
+        if (std.log.logEnabled(.debug, scope)) {
+            log.debug("Token: {any} '{s}'", .{ t.tag, try tokenizer.read_raw_token(t) });
+        }
         try tokens.append(gpa, t);
+        if (t.tag == .invalid) return error.UnexpectedToken;
         if (t.tag == .eof) break;
     } else |e| {
         return e;
@@ -179,39 +184,103 @@ pub fn parseFnArgs(self: *Parser) Error!Node.Index {
 }
 
 pub fn expectExpr(self: *Parser) Error!Node.Index {
-    return try self.parseExpr() orelse self.fail(.expected_expr);
+    return try self.parseExpr(0) orelse self.fail(.expected_expr);
 }
 
-pub fn parseExpr(self: *Parser) Error!?Node.Index {
+// const Assoc = enum {
+//     left,
+//     none,
+// };
+
+const OperInfo = struct {
+    prec: i8,
+    tag: Node.Tag,
+    // assoc: Assoc = Assoc.left,
+};
+
+const operTable = std.enums.directEnumArrayDefault(Token.Tag, OperInfo, .{ .prec = -1, .tag = Node.Tag.block }, 0, .{
+    .keyword_or = .{ .prec = 10, .tag = .bool_or },
+    .keyword_and = .{ .prec = 20, .tag = .bool_and },
+
+    .plus = .{ .prec = 30, .tag = .add },
+    .minus = .{ .prec = 30, .tag = .sub },
+
+    .star = .{ .prec = 40, .tag = .mul },
+});
+
+pub fn parseExpr(self: *Parser, min_prec: i32) Error!?Node.Index {
+    std.debug.assert(min_prec >= 0);
+    var node = try self.parseExprWithoutOperators() orelse return null;
+
+    // const banned_prec: i8 = -1;
+
+    while (true) {
+        const tok_tag = self.currentTag() orelse return error.ParseError;
+        const info = operTable[@as(usize, @intCast(@intFromEnum(tok_tag)))];
+        if (info.prec < min_prec) {
+            break;
+        }
+        // if (info.prec == banned_prec) {
+        //     @panic("handle chained comparisons");
+        // }
+
+        const oper_token = self.consumeNext();
+
+        const rhs = try self.parseExpr(info.prec + 1) orelse {
+            try self.warn(.expected_expr);
+            return node;
+        };
+
+        // TODO: Rethink the performance characteristics of this.
+        switch (info.tag) {
+            inline else => |t| {
+                if (@FieldType(Node.Data, @tagName(t)) == Ast.BinOp) {
+                    node = try self.addNode(.{
+                        .main_token = oper_token,
+                        .data = @unionInit(Node.Data, @tagName(t), .{ .lhs = node, .rhs = rhs }),
+                    });
+                } else return self.fail(.expected_operator);
+            },
+        }
+
+        // if (info.assoc == Assoc.none) {
+        //     banned_prec = info.prec;
+        // }
+    }
+
+    return node;
+}
+
+pub fn parseExprWithoutOperators(self: *Parser) Error!?Node.Index {
     if (self.currentTag()) |t| {
         log.debug("parseExpr hit tag: {any}", .{t});
-        switch (t) {
+        var node_idx = blk: switch (t) {
             .identifier => {
                 const ident = self.consumeNext();
                 if (self.consume(.eq)) |_| {
-                    const nodeIdx = try self.addNode(.{
+                    const node_idx = try self.addNode(.{
                         .data = .{
                             .var_definition = .{
                                 .binding = ident,
-                                // .value = try self.expectExpr(),
                                 .value = undefined,
                             },
                         },
                         .main_token = ident,
                     });
-                    errdefer self.nodes.orderedRemove(@intFromEnum(nodeIdx));
-                    self.nodeData(nodeIdx).var_definition.value = try self.expectExpr();
-                    return nodeIdx;
+                    errdefer self.nodes.orderedRemove(@intFromEnum(node_idx));
+                    const value = try self.expectExpr();
+                    self.nodeData(node_idx).var_definition.value = value;
+                    break :blk node_idx;
                 } else {
-                    return try self.addNode(.{
+                    break :blk try self.addNode(.{
                         .data = .{ .identifier = {} },
                         .main_token = ident,
                     });
                 }
             },
-            .number_literal => {
+            .number_literal, .string => {
                 const num = self.consumeNext();
-                return try self.addNode(.{
+                break :blk try self.addNode(.{
                     .data = .{ .literal = {} },
                     .main_token = num,
                 });
@@ -220,7 +289,7 @@ pub fn parseExpr(self: *Parser) Error!?Node.Index {
                 self.advance();
 
                 const ident = try self.expectConsume(.identifier);
-                const nodeIdx = try self.addNode(.{
+                const node_idx = try self.addNode(.{
                     .main_token = ident,
                     .data = .{ .def_proto = undefined },
                 });
@@ -229,7 +298,7 @@ pub fn parseExpr(self: *Parser) Error!?Node.Index {
                 _ = try self.expectConsume(.colon);
 
                 const body = try self.blockExpr(.{});
-                self.nodeData(nodeIdx).* = .{
+                self.nodeData(node_idx).* = .{
                     .def_proto = .{
                         .name = ident,
                         .args = args, // TODO: Parse args.
@@ -237,24 +306,103 @@ pub fn parseExpr(self: *Parser) Error!?Node.Index {
                     },
                 };
 
-                return nodeIdx;
+                break :blk node_idx;
             },
             .keyword_return => {
                 const ret = self.consumeNext();
-                const nodeIdx = try self.addNode(.{
+                const node_idx = try self.addNode(.{
                     .main_token = ret,
-                    .data = .{ .@"return" = try self.expectExpr() },
+                    .data = .{ .@"return" = undefined },
                 });
-                return nodeIdx;
+                const value = try self.expectExpr();
+                self.nodeData(node_idx).@"return" = value;
+                break :blk node_idx;
             },
             else => return self.fail(.expected_expr),
+        };
+
+        // Parse function call(s)
+        while (try self.parseSuffix(node_idx)) |new_idx| {
+            node_idx = new_idx;
         }
+
+        return node_idx;
     }
     return null;
 }
 
-pub fn fail(self: *Parser, tag: Ast.Error.Tag) Error {
+fn parseSuffix(self: *Parser, expr_idx: Node.Index) !?Node.Index {
+    // Function calls
+    if (self.consume(.l_paren)) |lparen| {
+        const old_len = self.scratch.items.len;
+        defer self.scratch.shrinkRetainingCapacity(old_len);
+
+        // Parse arguments
+        while (true) {
+            if (self.currentTag() == .r_paren) {
+                break;
+            }
+
+            const arg = try self.expectExpr();
+            try self.scratch.append(self.gpa, arg);
+
+            if (self.consume(.comma)) |_| {
+                continue;
+            } else if (self.currentTag() == .r_paren) {
+                break;
+            } else {
+                return self.fail(.expected_expr);
+            }
+        }
+
+        _ = try self.expectConsume(.r_paren);
+
+        const args_slice = try self.arena.allocator().dupe(Node.Index, self.scratch.items[old_len..]);
+        const args_node = try self.addNode(.{
+            .data = .{ .call_args = .{ .args = args_slice } },
+            .main_token = lparen,
+        });
+
+        return try self.addNode(.{
+            .data = .{
+                .call = .{
+                    .func = expr_idx,
+                    .args = args_node,
+                },
+            },
+            .main_token = lparen,
+        });
+    }
+
+    if (self.consume(.dot)) |_| {
+        const attr_name = try self.expectConsume(.identifier);
+
+        return try self.addNode(.{ .main_token = attr_name, .data = .{
+            .get_attribute = .{
+                .attr = attr_name,
+                .obj = expr_idx,
+            },
+        } });
+    }
+
+    return null;
+}
+
+pub fn warn(self: *Parser, tag: Ast.Error.Tag) Allocator.Error!void {
     try self.errors.append(self.gpa, .{ .tag = tag, .token = self.tokenIdx() });
+}
+
+pub fn warnMsg(self: *Parser, msg: Ast.Error) Allocator.Error!void {
+    try self.errors.append(self.gpa, msg);
+}
+
+pub fn fail(self: *Parser, tag: Ast.Error.Tag) Error {
+    try self.warn(tag);
+    return error.ParseError;
+}
+
+pub fn failMsg(self: *Parser, msg: Ast.Error) Error {
+    try self.warnMsg(msg);
     return error.ParseError;
 }
 
