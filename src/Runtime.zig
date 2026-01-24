@@ -16,6 +16,10 @@ frames: std.SegmentedList(Frame, 4096) = .{},
 stack: std.ArrayList(*StarObj) = .empty,
 /// Globals
 globals: std.StringHashMapUnmanaged(*StarObj) = .empty,
+/// Source code of current module, mostly for error reporting
+current_source: ?[:0]const u8 = null,
+/// Optional diagnostic to populate on error
+diagnostic: ?*Diagnostic = null,
 
 const knobs = struct {
     const locals_initial_capacity: usize = 16;
@@ -76,6 +80,131 @@ pub const RuntimeError = error{
 };
 
 pub const Error = Allocator.Error || std.Io.Writer.Error || TypeError || RuntimeError;
+
+/// Represents a source location in the original source code
+pub const SourceLoc = struct {
+    byte_offset: u32,
+    len: u16,
+
+    pub const none: SourceLoc = .{ .byte_offset = 0, .len = 0 };
+};
+
+/// A single entry in the stack trace
+pub const StackTraceEntry = struct {
+    func_name: []const u8,
+    source_loc: SourceLoc,
+};
+
+/// Diagnostic populated on error
+pub const Diagnostic = struct {
+    allocator: Allocator = undefined,
+    err: Error = error.FrameMissing,
+    trace: []const StackTraceEntry = &.{},
+    source: ?[:0]const u8 = null,
+
+    const style = struct {
+        const reset = "\x1b[0m";
+        const bold_red = "\x1b[1;31m";
+        const cyan = "\x1b[36m";
+        const yellow = "\x1b[33m";
+        const bold_green = "\x1b[1;32m";
+    };
+
+    fn offsetToLineCol(source: [:0]const u8, offset: u32) struct { line: u32, col: u32 } {
+        var line: u32 = 1;
+        var col: u32 = 1;
+        for (source[0..@min(offset, @as(u32, @intCast(source.len)))]) |c| {
+            if (c == '\n') {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+        return .{ .line = line, .col = col };
+    }
+
+    fn getSourceLine(source: [:0]const u8, offset: u32) []const u8 {
+        const clamped = @min(offset, @as(u32, @intCast(source.len)));
+        var start: usize = clamped;
+        while (start > 0 and source[start - 1] != '\n') start -= 1;
+        var end: usize = clamped;
+        while (end < source.len and source[end] != '\n') end += 1;
+        return source[start..end];
+    }
+
+    fn getLineStartOffset(source: [:0]const u8, offset: u32) u32 {
+        var pos: u32 = @min(offset, @as(u32, @intCast(source.len)));
+        while (pos > 0 and source[pos - 1] != '\n') pos -= 1;
+        return pos;
+    }
+
+    fn getErrorCategory(err: Error) []const u8 {
+        return switch (err) {
+            error.TypeMismatch => "TypeError",
+            error.AddOpUndefined, error.SubOpUndefined, error.MulOpUndefined,
+            error.ArityMismatch, error.LocalOutOfRange, error.LocalUninitialized,
+            error.ConstOutOfRange, error.StackUnderflow, error.CallUndefined,
+            error.FrameMissing, error.FrameNoReturn, error.ReturnedOutsideFunction,
+            error.AttributeMissing, error.GlobalUndefined, error.FreeVarOutOfRange,
+            => "RuntimeError",
+            error.OutOfMemory => "MemoryError",
+            else => "Error",
+        };
+    }
+
+    /// Format as a Python-style traceback
+    pub fn format(self: *const Diagnostic, writer: *std.Io.Writer) !void {
+        try writer.print("\n" ++ style.bold_red ++ "Traceback" ++ style.reset ++ " (most recent call last):\n", .{});
+
+        for (self.trace, 0..) |entry, idx| {
+            const is_innermost = idx == self.trace.len - 1;
+
+            if (self.source) |source| {
+                const loc = offsetToLineCol(source, entry.source_loc.byte_offset);
+                try writer.print(
+                    "  File " ++ style.cyan ++ "\"<source>\"" ++ style.reset ++
+                        ", line " ++ style.yellow ++ "{d}" ++ style.reset ++
+                        ", in " ++ style.bold_green ++ "{s}" ++ style.reset ++ "\n",
+                    .{ loc.line, entry.func_name },
+                );
+
+                const line_content = getSourceLine(source, entry.source_loc.byte_offset);
+                const leading_ws = line_content.len - std.mem.trimLeft(u8, line_content, " \t").len;
+                try writer.print("    {s}\n", .{line_content[leading_ws..]});
+
+                if (is_innermost and entry.source_loc.len > 0) {
+                    const line_start = getLineStartOffset(source, entry.source_loc.byte_offset);
+                    const col = entry.source_loc.byte_offset - line_start;
+                    const adjusted = if (col >= leading_ws) col - @as(u32, @intCast(leading_ws)) else 0;
+
+                    try writer.print("    ", .{});
+                    for (0..adjusted) |_| try writer.print(" ", .{});
+                    try writer.print(style.bold_red, .{});
+                    for (0..entry.source_loc.len) |_| try writer.print("^", .{});
+                    try writer.print(style.reset ++ "\n", .{});
+                }
+            } else {
+                try writer.print(
+                    "  File " ++ style.cyan ++ "\"<source>\"" ++ style.reset ++
+                        ", in " ++ style.bold_green ++ "{s}" ++ style.reset ++ "\n",
+                    .{entry.func_name},
+                );
+            }
+        }
+
+        try writer.print(style.bold_red ++ "{s}" ++ style.reset ++ ": {s}\n\n", .{
+            getErrorCategory(self.err), @errorName(self.err),
+        });
+    }
+
+    pub fn deinit(self: *Diagnostic) void {
+        if (self.trace.len > 0) {
+            self.allocator.free(self.trace);
+        }
+        self.* = .{};
+    }
+};
 
 const Frame = struct {
     func: *StarFunc,
@@ -187,15 +316,48 @@ fn loadGlobal(self: *Runtime, name_idx: GlobalIdx) Error!*StarObj {
     return self.globals.get(name) orelse return RuntimeError.GlobalUndefined;
 }
 
-// Step until frame stack is empty
+/// Populate diagnostic with stack trace if required.
+fn fillDiagnostic(self: *Runtime, err: Error) void {
+    const diag = self.diagnostic orelse return;
+
+    diag.allocator = self.gpa;
+    diag.err = err;
+    diag.source = self.current_source;
+
+    if (self.frames.len == 0) {
+        diag.trace = &.{};
+        return;
+    }
+
+    var entries = std.ArrayList(StackTraceEntry).empty;
+    var i: usize = 0;
+    while (i < self.frames.len) : (i += 1) {
+        const frame = self.frames.at(i);
+        const func = frame.func;
+        const pc = if (frame.pc > 0) frame.pc - 1 else 0;
+        const source_loc = if (pc < func.source_locs.len) func.source_locs[pc] else SourceLoc.none;
+
+        entries.append(self.gpa, .{ .func_name = func.name, .source_loc = source_loc }) catch {
+            diag.trace = &.{};
+            return;
+        };
+    }
+
+    diag.trace = entries.toOwnedSlice(self.gpa) catch &.{};
+}
+
+/// Step until frame stack is empty, filling in diagnostics in case of error.
 pub fn stepUntilDone(self: *Runtime) Error!void {
     while (self.frames.len > 0) {
-        try self.step();
+        self.step() catch |err| {
+            self.fillDiagnostic(err);
+            return err;
+        };
     }
 }
 
-// Move interpreter forward one step.
-pub fn step(self: *Runtime) Error!void {
+// Move interpreter forward one step. DOES NOT populate error diagnostics.
+fn step(self: *Runtime) Error!void {
     if (self.frames.len == 0) return RuntimeError.FrameMissing;
     var frame: *Frame = self.frames.at(self.frames.len - 1);
     const active_code = frame.func.code;
@@ -338,6 +500,8 @@ pub fn step(self: *Runtime) Error!void {
                 .names_local = base_func.names_local,
                 .names_free = base_func.names_free,
                 .closure_cells = closure_cells,
+                .name = base_func.name,
+                .source_locs = base_func.source_locs,
             };
 
             try self.stackPush(&closure_func.obj);
@@ -386,14 +550,14 @@ pub fn takeOwnedGlobals(self: *Runtime) std.StringHashMapUnmanaged(*StarObj) {
     return old_globals;
 }
 
-pub fn execModule(self: *Runtime, module: *const Compiler.Module) !void {
+pub fn execModule(self: *Runtime, module: *const Compiler.Module) Error!void {
     const mod = try StarModule.fromCompiledModule(self.gc, module);
+    self.current_source = module.source;
 
     std.debug.assert(mod.init_fn.arity == 0);
     try self.stackPush(&mod.init_fn.obj);
     try self.callFn(&mod.init_fn, &.{});
     try self.stepUntilDone();
-    // Module inits return None
     _ = try self.stackPop();
 }
 
@@ -622,6 +786,11 @@ pub const StarFunc = struct {
     /// Closure cells (captured variables)
     closure_cells: []const *StarObj = &.{},
 
+    /// Function name (or "<module>" for top-level)
+    name: []const u8 = "<anonymous>",
+    /// Source locations parallel to code, maps each instruction to source
+    source_locs: []const SourceLoc = &.{},
+
     native_fn: ?*const fn (rt: *Runtime, args: []*StarObj) Error!*StarObj = null,
 
     obj: StarObj = .{
@@ -765,6 +934,8 @@ pub const StarModule = struct {
             .names_local = &.{},
             .names_free = &.{},
             .names_global = module.global_names,
+            .name = "<module>",
+            .source_locs = module.source_locs,
         });
         return mod;
     }
@@ -914,8 +1085,8 @@ test "Runtime executes add function" {
     // At the end, top of stack should be the result
     try std.testing.expectEqual(1, rt.stack.items.len);
     const result_obj = rt.stack.items[0];
-    const result = try downCast(StarInt, result_obj);
-    try std.testing.expectEqual(11, result.num);
+    const result_int = try downCast(StarInt, result_obj);
+    try std.testing.expectEqual(11, result_int.num);
 }
 
 test "StarObj attributes work" {
@@ -1053,8 +1224,8 @@ test "Instruction.store and load locals" {
     try rt.stepUntilDone();
 
     const result_obj = rt.stack.items[0];
-    const result = try downCast(StarInt, result_obj);
-    try std.testing.expectEqual(77, result.num);
+    const result_int = try downCast(StarInt, result_obj);
+    try std.testing.expectEqual(77, result_int.num);
 }
 
 test "Instruction.call fails on non-function" {

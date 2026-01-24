@@ -67,7 +67,20 @@ pub fn main() !void {
     defer runtime.deinit();
 
     try runtime.registerStdlib(Stdlib);
-    try runtime.execModule(&module);
+
+    var diag: Runtime.Diagnostic = .{};
+    defer diag.deinit();
+    runtime.diagnostic = &diag;
+
+    runtime.execModule(&module) catch {
+        var stderr_buf: [4096]u8 = undefined;
+        var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+        var stderr = &stderr_writer.interface;
+
+        diag.format(stderr) catch {};
+        stderr.flush() catch {};
+        std.process.exit(1);
+    };
 }
 
 const Stdlib = Runtime.StarNativeModule(struct {

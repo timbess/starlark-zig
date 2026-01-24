@@ -21,6 +21,10 @@ pub const Module = struct {
     code: []Runtime.Instruction,
     constants: []*Runtime.StarObj,
     global_names: [][]const u8,
+    /// Reference to original source code
+    source: [:0]const u8,
+    /// Source locations parallel to code
+    source_locs: []Runtime.SourceLoc,
 };
 
 pub const Function = struct {
@@ -113,7 +117,9 @@ const CodeBuilder = struct {
     code: std.ArrayList(Runtime.Instruction) = .empty,
     constants: std.ArrayList(*Runtime.StarObj) = .empty,
     const_map: std.AutoHashMapUnmanaged(*Runtime.StarObj, Runtime.ConstIdx) = .empty,
+    source_locs: std.ArrayList(Runtime.SourceLoc) = .empty,
     interner: *StringInterner,
+    current_loc: Runtime.SourceLoc = Runtime.SourceLoc.none,
 
     fn init(gc: Allocator, interner: *StringInterner) CodeBuilder {
         return .{
@@ -122,8 +128,22 @@ const CodeBuilder = struct {
         };
     }
 
+    /// Set the current source location for subsequent emissions
+    inline fn setLoc(self: *@This(), loc: Runtime.SourceLoc) void {
+        self.current_loc = loc;
+    }
+
+    /// Set the current source location from a token location
+    inline fn setLocFromToken(self: *@This(), tok_loc: Token.Loc) void {
+        self.current_loc = .{
+            .byte_offset = @intCast(tok_loc.start),
+            .len = @intCast(@min(tok_loc.end - tok_loc.start, std.math.maxInt(u16))),
+        };
+    }
+
     inline fn emit(self: *@This(), instruction: Runtime.Instruction) !void {
         try self.code.append(self.gc, instruction);
+        try self.source_locs.append(self.gc, self.current_loc);
     }
 
     inline fn addConst(self: *@This(), obj: *Runtime.StarObj) !Runtime.ConstIdx {
@@ -330,6 +350,9 @@ fn compileExpr(
             .compile_expr => {
                 const node = ast.nodes.get(@intFromEnum(work.node_idx));
 
+                const main_tok = ast.tokens.get(@intFromEnum(node.main_token));
+                builder.setLocFromToken(main_tok.loc);
+
                 switch (node.data) {
                     .literal => {
                         const obj = try compileLiteral(builder, ast, source, node);
@@ -424,6 +447,7 @@ fn compileFunction(
     parent_scope: *Scope,
     body_idx: Ast.Node.Index,
     args_idx: Ast.Node.Index,
+    func_name: []const u8,
 ) Error!*Runtime.StarFunc {
     var func_compiler = try FunctionCompiler.init(gc, arena, interner, parent_scope);
     defer func_compiler.deinit();
@@ -458,7 +482,7 @@ fn compileFunction(
                 const name_tok = ast.tokens.get(@intFromEnum(d.name));
                 const fn_name = source[name_tok.loc.start..name_tok.loc.end];
 
-                const nested_func_obj = try compileFunction(gc, arena, ast, source, interner, &func_compiler.scope, d.body, d.args);
+                const nested_func_obj = try compileFunction(gc, arena, ast, source, interner, &func_compiler.scope, d.body, d.args, fn_name);
 
                 const func_idx = try func_compiler.base.addConst(&nested_func_obj.obj);
 
@@ -501,6 +525,8 @@ fn compileFunction(
         .names_free = try func_compiler.free_names.toOwnedSlice(gc),
         .names_global = try func_compiler.global_names.toOwnedSlice(gc),
         .closure_cells = &.{},
+        .name = func_name,
+        .source_locs = try func_compiler.base.source_locs.toOwnedSlice(gc),
     };
 
     return func;
@@ -528,6 +554,9 @@ fn compileModule(
     for (root_node.data.block.statements) |stmt_idx| {
         const stmt_node = ast.nodes.get(@intFromEnum(stmt_idx));
 
+        const main_tok = ast.tokens.get(@intFromEnum(stmt_node.main_token));
+        module_compiler.base.setLocFromToken(main_tok.loc);
+
         switch (stmt_node.data) {
             .var_definition => |v| {
                 try compileExpr(ast, source, &module_compiler.base, &module_compiler.scope, v.value, null, &module_compiler);
@@ -541,7 +570,7 @@ fn compileModule(
                 const name_tok = ast.tokens.get(@intFromEnum(d.name));
                 const fn_name = source[name_tok.loc.start..name_tok.loc.end];
 
-                const func_obj = try compileFunction(gc, arena, ast, source, interner, &module_compiler.scope, d.body, d.args);
+                const func_obj = try compileFunction(gc, arena, ast, source, interner, &module_compiler.scope, d.body, d.args, fn_name);
                 const func_idx = try module_compiler.base.addConst(&func_obj.obj);
 
                 if (func_obj.names_free.len > 0) {
@@ -570,6 +599,8 @@ fn compileModule(
         .code = try module_compiler.base.code.toOwnedSlice(gc),
         .constants = try module_compiler.base.constants.toOwnedSlice(gc),
         .global_names = try module_compiler.global_names.toOwnedSlice(gc),
+        .source = source,
+        .source_locs = try module_compiler.base.source_locs.toOwnedSlice(gc),
     };
 }
 
