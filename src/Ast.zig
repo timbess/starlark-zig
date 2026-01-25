@@ -72,10 +72,23 @@ pub const Node = struct {
         call_args,
         bool_and,
         bool_or,
+        bool_not,
         add,
         sub,
         mul,
+        eq,
+        ne,
+        lt,
+        le,
+        gt,
+        ge,
         get_attribute,
+        list_literal,
+        index,
+        @"if",
+        @"for",
+        @"break",
+        @"continue",
     };
 
     pub const Data = union(Tag) {
@@ -109,13 +122,39 @@ pub const Node = struct {
         },
         bool_and: BinOp,
         bool_or: BinOp,
+        bool_not: Node.Index,
         add: BinOp,
         sub: BinOp,
         mul: BinOp,
+        eq: BinOp,
+        ne: BinOp,
+        lt: BinOp,
+        le: BinOp,
+        gt: BinOp,
+        ge: BinOp,
         get_attribute: struct {
             obj: Node.Index,
             attr: Token.Index,
         },
+        list_literal: struct {
+            elements: []const Node.Index,
+        },
+        index: struct {
+            obj: Node.Index,
+            idx: Node.Index,
+        },
+        @"if": struct {
+            condition: Node.Index,
+            then_body: Node.Index,
+            else_body: Node.Index,
+        },
+        @"for": struct {
+            binding: Token.Index,
+            iterable: Node.Index,
+            body: Node.Index,
+        },
+        @"break": void,
+        @"continue": void,
     };
 };
 
@@ -257,7 +296,7 @@ pub const DebugNodeFormatter = std.fmt.Formatter(*const Ast, struct {
                                 }
                             }
                         },
-                        .bool_and, .bool_or, .add, .sub => |binop| {
+                        .bool_and, .bool_or, .add, .sub, .mul, .eq, .ne, .lt, .le, .gt, .ge, .index => |binop| {
                             try writer.print(", lhs=\n", .{});
 
                             try stack.appendBounded(.{ .idx = frame.idx, .state = .close_node, .indent = frame.indent });
@@ -267,6 +306,47 @@ pub const DebugNodeFormatter = std.fmt.Formatter(*const Ast, struct {
                             try writer.print(", rhs=\n", .{});
 
                             try stack.appendBounded(.{ .idx = binop.lhs, .state = .start, .indent = frame.indent + 1 });
+                        },
+                        .bool_not => |operand| {
+                            try writer.print(", operand=\n", .{});
+                            try stack.appendBounded(.{ .idx = frame.idx, .state = .close_node, .indent = frame.indent });
+                            try stack.appendBounded(.{ .idx = operand, .state = .start, .indent = frame.indent + 1 });
+                        },
+                        .get_attribute => |ga| {
+                            try writer.print(", attr=", .{});
+                            try formatToken(ast, writer, ga.attr);
+                            try writer.print(", obj=\n", .{});
+                            try stack.appendBounded(.{ .idx = frame.idx, .state = .close_node, .indent = frame.indent });
+                            try stack.appendBounded(.{ .idx = ga.obj, .state = .start, .indent = frame.indent + 1 });
+                        },
+                        .list_literal => |ll| {
+                            try writer.print(", elements=[\n", .{});
+                            try stack.appendBounded(.{ .idx = frame.idx, .state = .close_node, .indent = frame.indent });
+                            try stack.appendBounded(.{ .idx = frame.idx, .state = .close_array, .indent = frame.indent + 1 });
+                            if (ll.elements.len > 0) {
+                                for (ll.elements, 0..) |_, i| {
+                                    const rev = ll.elements.len - 1 - i;
+                                    try stack.appendBounded(.{ .idx = ll.elements[rev], .state = .start, .indent = frame.indent + 1 });
+                                }
+                            }
+                        },
+                        .@"if" => |if_node| {
+                            try writer.print(", cond=\n", .{});
+                            try stack.appendBounded(.{ .idx = frame.idx, .state = .close_node, .indent = frame.indent });
+                            try stack.appendBounded(.{ .idx = if_node.else_body, .state = .start, .indent = frame.indent + 1 });
+                            try stack.appendBounded(.{ .idx = if_node.then_body, .state = .start, .indent = frame.indent + 1 });
+                            try stack.appendBounded(.{ .idx = if_node.condition, .state = .start, .indent = frame.indent + 1 });
+                        },
+                        .@"for" => |for_node| {
+                            try writer.print(", binding=", .{});
+                            try formatToken(ast, writer, for_node.binding);
+                            try writer.print(", iterable=\n", .{});
+                            try stack.appendBounded(.{ .idx = frame.idx, .state = .close_node, .indent = frame.indent });
+                            try stack.appendBounded(.{ .idx = for_node.body, .state = .start, .indent = frame.indent + 1 });
+                            try stack.appendBounded(.{ .idx = for_node.iterable, .state = .start, .indent = frame.indent + 1 });
+                        },
+                        .@"break", .@"continue" => {
+                            try writer.print(")\n", .{});
                         },
                     }
                 },

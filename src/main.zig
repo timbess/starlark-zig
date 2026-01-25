@@ -62,7 +62,7 @@ pub fn main() !void {
     // try stdout.print("AST:\n{f}\n", .{Ast.DebugNodeFormatter{ .data = &ast }});
 
     const gc = Gc.allocator();
-    const module = try Compiler.compile(gpa, "<main>", code, &ast, .{}, gc);
+    const module = try Compiler.compile(gpa, if (file) |_| args[1] else "<stdin>", code, &ast, .{}, gc);
     var runtime = try Runtime.init(gpa, .{ .gc = gc });
     defer runtime.deinit();
 
@@ -90,7 +90,7 @@ const Stdlib = Runtime.StarNativeModule(struct {
         return &new.obj;
     }
 
-    pub fn print(_: *Runtime, args: []*Runtime.StarObj) Runtime.Error!?*Runtime.StarObj {
+    pub fn print(_: *Runtime, args: []const *Runtime.StarObj) Runtime.Error!?*Runtime.StarObj {
         var stdout_buf: [4096]u8 = undefined;
         var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
         var stdout = &stdout_writer.interface;
@@ -109,6 +109,51 @@ const Stdlib = Runtime.StarNativeModule(struct {
         }
         try stdout.print("\n", .{});
         return null;
+    }
+
+    pub fn range(rt: *Runtime, args: []const *Runtime.StarObj) Runtime.Error!?*Runtime.StarObj {
+        var start: i64 = 0;
+        var stop: i64 = 0;
+        var step_val: i64 = 1;
+
+        switch (args.len) {
+            1 => {
+                const stop_int = try Runtime.downCast(Runtime.StarInt, args[0]);
+                stop = @intCast(stop_int.num);
+            },
+            2 => {
+                const start_int = try Runtime.downCast(Runtime.StarInt, args[0]);
+                const stop_int = try Runtime.downCast(Runtime.StarInt, args[1]);
+                start = @intCast(start_int.num);
+                stop = @intCast(stop_int.num);
+            },
+            3 => {
+                const start_int = try Runtime.downCast(Runtime.StarInt, args[0]);
+                const stop_int = try Runtime.downCast(Runtime.StarInt, args[1]);
+                const step_int = try Runtime.downCast(Runtime.StarInt, args[2]);
+                start = @intCast(start_int.num);
+                stop = @intCast(stop_int.num);
+                step_val = @intCast(step_int.num);
+            },
+            else => return Runtime.RuntimeError.ArityMismatch,
+        }
+
+        const iter = try Runtime.StarRangeIter.init(rt.gc, start, stop, step_val);
+        return &iter.obj;
+    }
+
+    pub fn len(rt: *Runtime, args: []const *Runtime.StarObj) Runtime.Error!?*Runtime.StarObj {
+        if (args.len != 1) return Runtime.RuntimeError.ArityMismatch;
+
+        if (Runtime.downCast(Runtime.StarList, args[0])) |list| {
+            const result = try Runtime.StarInt.init(rt.gc, list.items.items.len);
+            return &result.obj;
+        } else |_| if (Runtime.downCast(Runtime.StarStr, args[0])) |str| {
+            const result = try Runtime.StarInt.init(rt.gc, str.str.len);
+            return &result.obj;
+        } else |_| {
+            return Runtime.TypeError.TypeMismatch;
+        }
     }
 });
 

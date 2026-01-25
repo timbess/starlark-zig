@@ -202,6 +202,13 @@ const operTable = std.enums.directEnumArrayDefault(Token.Tag, OperInfo, .{ .prec
     .keyword_or = .{ .prec = 10, .tag = .bool_or },
     .keyword_and = .{ .prec = 20, .tag = .bool_and },
 
+    .eq_eq = .{ .prec = 25, .tag = .eq },
+    .bang_eq = .{ .prec = 25, .tag = .ne },
+    .lt = .{ .prec = 25, .tag = .lt },
+    .lt_eq = .{ .prec = 25, .tag = .le },
+    .gt = .{ .prec = 25, .tag = .gt },
+    .gt_eq = .{ .prec = 25, .tag = .ge },
+
     .plus = .{ .prec = 30, .tag = .add },
     .minus = .{ .prec = 30, .tag = .sub },
 
@@ -278,11 +285,42 @@ pub fn parseExprWithoutOperators(self: *Parser) Error!?Node.Index {
                     });
                 }
             },
-            .number_literal, .string => {
+            .number_literal, .string, .keyword_true, .keyword_false => {
                 const num = self.consumeNext();
                 break :blk try self.addNode(.{
                     .data = .{ .literal = {} },
                     .main_token = num,
+                });
+            },
+            .keyword_not => {
+                const not_tok = self.consumeNext();
+                const operand = try self.expectExpr();
+                break :blk try self.addNode(.{
+                    .data = .{ .bool_not = operand },
+                    .main_token = not_tok,
+                });
+            },
+            .l_bracket => {
+                break :blk try self.parseListLiteral();
+            },
+            .keyword_if => {
+                break :blk try self.parseIfStatement();
+            },
+            .keyword_for => {
+                break :blk try self.parseForLoop();
+            },
+            .keyword_break => {
+                const tok = self.consumeNext();
+                break :blk try self.addNode(.{
+                    .data = .{ .@"break" = {} },
+                    .main_token = tok,
+                });
+            },
+            .keyword_continue => {
+                const tok = self.consumeNext();
+                break :blk try self.addNode(.{
+                    .data = .{ .@"continue" = {} },
+                    .main_token = tok,
                 });
             },
             .keyword_def => {
@@ -385,7 +423,101 @@ fn parseSuffix(self: *Parser, expr_idx: Node.Index) !?Node.Index {
         } });
     }
 
+    if (self.consume(.l_bracket)) |lbracket| {
+        const idx_expr = try self.expectExpr();
+        _ = try self.expectConsume(.r_bracket);
+
+        return try self.addNode(.{
+            .main_token = lbracket,
+            .data = .{
+                .index = .{
+                    .obj = expr_idx,
+                    .idx = idx_expr,
+                },
+            },
+        });
+    }
+
     return null;
+}
+
+fn parseListLiteral(self: *Parser) Error!Node.Index {
+    const old_len = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(old_len);
+
+    const lbracket = try self.expectConsume(.l_bracket);
+
+    while (true) {
+        if (self.currentTag() == .r_bracket) {
+            break;
+        }
+
+        const elem = try self.expectExpr();
+        try self.scratch.append(self.gpa, elem);
+
+        if (self.consume(.comma)) |_| {
+            continue;
+        } else if (self.currentTag() == .r_bracket) {
+            break;
+        } else {
+            return self.fail(.expected_expr);
+        }
+    }
+
+    _ = try self.expectConsume(.r_bracket);
+
+    const elements = try self.arena.allocator().dupe(Node.Index, self.scratch.items[old_len..]);
+    return try self.addNode(.{
+        .main_token = lbracket,
+        .data = .{ .list_literal = .{ .elements = elements } },
+    });
+}
+
+fn parseIfStatement(self: *Parser) Error!Node.Index {
+    const if_tok = self.consume(.keyword_if) orelse self.consume(.keyword_elif) orelse return self.fail(.expected_expr);
+    const condition = try self.expectExpr();
+    _ = try self.expectConsume(.colon);
+    const then_body = try self.blockExpr(.{});
+
+    var else_body: Node.Index = .none;
+
+    if (self.currentTag() == .keyword_elif) {
+        else_body = try self.parseIfStatement();
+    } else if (self.consume(.keyword_else)) |_| {
+        _ = try self.expectConsume(.colon);
+        else_body = try self.blockExpr(.{});
+    }
+
+    return try self.addNode(.{
+        .main_token = if_tok,
+        .data = .{
+            .@"if" = .{
+                .condition = condition,
+                .then_body = then_body,
+                .else_body = else_body,
+            },
+        },
+    });
+}
+
+fn parseForLoop(self: *Parser) Error!Node.Index {
+    const for_tok = try self.expectConsume(.keyword_for);
+    const binding = try self.expectConsume(.identifier);
+    _ = try self.expectConsume(.keyword_in);
+    const iterable = try self.expectExpr();
+    _ = try self.expectConsume(.colon);
+    const body = try self.blockExpr(.{});
+
+    return try self.addNode(.{
+        .main_token = for_tok,
+        .data = .{
+            .@"for" = .{
+                .binding = binding,
+                .iterable = iterable,
+                .body = body,
+            },
+        },
+    });
 }
 
 pub fn warn(self: *Parser, tag: Ast.Error.Tag) Allocator.Error!void {

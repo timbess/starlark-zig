@@ -17,6 +17,11 @@ zig build run-test-star --watch
 
 That will rerun the build/interpreter on every change to a source file or `test.star`.
 
+## Error Reporting
+
+It has some basic error reporting with a traceback and line numbers:
+![img](./docs/imgs/error_reporting.png)
+
 # TODO
 
 - [ ] Make pool for small numbers/strings.

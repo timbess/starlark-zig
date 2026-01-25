@@ -143,8 +143,40 @@ const CodeBuilder = struct {
 
     inline fn emit(self: *@This(), instruction: Runtime.Instruction) !void {
         try self.code.append(self.gc, instruction);
+        // TODO: This isn't great for efficiency, but it's convenient atm.
         try self.source_locs.append(self.gc, self.current_loc);
     }
+
+    inline fn emitJump(self: *@This(), tag: JumpTag) !usize {
+        const idx = self.code.items.len;
+        try self.code.append(self.gc, switch (tag) {
+            .jump => .{ .jump = 0 },
+            .jump_if_false => .{ .jump_if_false = 0 },
+            .jump_if_true => .{ .jump_if_true = 0 },
+            .for_iter => .{ .for_iter = 0 },
+        });
+        try self.source_locs.append(self.gc, self.current_loc);
+        return idx;
+    }
+
+    inline fn patchJump(self: *@This(), idx: usize) void {
+        const target: i32 = @intCast(self.code.items.len);
+        const from: i32 = @intCast(idx + 1);
+        const offset: i32 = target - from;
+        self.code.items[idx] = switch (self.code.items[idx]) {
+            .jump => .{ .jump = offset },
+            .jump_if_false => .{ .jump_if_false = offset },
+            .jump_if_true => .{ .jump_if_true = offset },
+            .for_iter => .{ .for_iter = offset },
+            else => unreachable,
+        };
+    }
+
+    inline fn currentOffset(self: *@This()) usize {
+        return self.code.items.len;
+    }
+
+    const JumpTag = enum { jump, jump_if_false, jump_if_true, for_iter };
 
     inline fn addConst(self: *@This(), obj: *Runtime.StarObj) !Runtime.ConstIdx {
         const gop = try self.const_map.getOrPut(self.gc, obj);
@@ -161,6 +193,11 @@ const CodeBuilder = struct {
     }
 };
 
+const LoopContext = struct {
+    continue_target: usize,
+    break_patches: std.ArrayList(usize),
+};
+
 const FunctionCompiler = struct {
     base: CodeBuilder,
     local_names: std.ArrayList([]const u8) = .empty,
@@ -171,6 +208,7 @@ const FunctionCompiler = struct {
     scope: Scope,
     arity: usize,
     arena: Allocator,
+    loop_stack: std.ArrayList(LoopContext) = .empty,
 
     fn init(gc: Allocator, arena: Allocator, interner: *StringInterner, parent_scope: ?*Scope) !FunctionCompiler {
         return .{
@@ -311,10 +349,11 @@ inline fn compileLiteral(
             const str_parsed = std.zig.string_literal.parseAlloc(builder.gc, string_literal) catch return error.LiteralInvalid;
             defer builder.gc.free(str_parsed);
             const interned = try builder.internString(str_parsed);
-            const str_star = try builder.gc.create(Runtime.StarStr);
-            str_star.* = .{ .str = interned };
+            const str_star = try Runtime.StarStr.init(builder.gc, interned);
             return &str_star.obj;
         },
+        .keyword_true => return Runtime.StarBool.get(true),
+        .keyword_false => return Runtime.StarBool.get(false),
         else => return error.LiteralInvalid,
     }
 }
@@ -335,6 +374,9 @@ fn compileExpr(
             emit_call,
             emit_binop,
             emit_getattr,
+            emit_bool_not,
+            emit_build_list,
+            emit_get_index,
         },
         node_idx: Ast.Node.Index,
         extra: u32 = 0, // Used for arity in calls, binop type
@@ -399,20 +441,31 @@ fn compileExpr(
 
                         try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = c.func });
                     },
-                    .add, .sub, .mul => |binop| {
-                        switch (std.meta.activeTag(node.data)) {
-                            inline else => |t| {
-                                // We already know it's add/sub/mul
-                                if (!@hasField(Runtime.BinOp, @tagName(t))) unreachable;
-                                try work_stack.appendBounded(.{ .kind = .emit_binop, .node_idx = work.node_idx, .extra = @intFromEnum(@field(Runtime.BinOp, @tagName(t))) });
-                            },
-                        }
+                    .add, .sub, .mul, .eq, .ne, .lt, .le, .gt, .ge => |binop| {
+                        try work_stack.appendBounded(.{ .kind = .emit_binop, .node_idx = work.node_idx });
                         try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = binop.rhs });
                         try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = binop.lhs });
+                    },
+                    .bool_not => |operand| {
+                        try work_stack.appendBounded(.{ .kind = .emit_bool_not, .node_idx = work.node_idx });
+                        try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = operand });
                     },
                     .get_attribute => |getattr| {
                         try work_stack.appendBounded(.{ .kind = .emit_getattr, .node_idx = work.node_idx, .extra = @intFromEnum(getattr.attr) });
                         try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = getattr.obj });
+                    },
+                    .list_literal => |ll| {
+                        try work_stack.appendBounded(.{ .kind = .emit_build_list, .node_idx = work.node_idx, .extra = @intCast(ll.elements.len) });
+                        var i: usize = ll.elements.len;
+                        while (i > 0) {
+                            i -= 1;
+                            try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = ll.elements[i] });
+                        }
+                    },
+                    .index => |idx| {
+                        try work_stack.appendBounded(.{ .kind = .emit_get_index, .node_idx = work.node_idx });
+                        try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = idx.idx });
+                        try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = idx.obj });
                     },
                     else => {
                         log.err("Unexpected expression node: {any}", .{std.meta.activeTag(node.data)});
@@ -428,11 +481,230 @@ fn compileExpr(
                 try builder.emit(.{ .call = work.extra });
             },
             .emit_binop => {
-                const binop: Runtime.BinOp = @enumFromInt(work.extra);
+                const binop_node = ast.nodes.get(@intFromEnum(work.node_idx));
+                const binop: Runtime.BinOp = switch (std.meta.activeTag(binop_node.data)) {
+                    inline .add, .sub, .mul, .eq, .ne, .lt, .le, .gt, .ge => |tag| @field(Runtime.BinOp, @tagName(tag)),
+                    else => unreachable,
+                };
                 try builder.emit(.{ .binary_op = binop });
+            },
+            .emit_bool_not => {
+                try builder.emit(.bool_not);
+            },
+            .emit_build_list => {
+                try builder.emit(.{ .build_list = work.extra });
+            },
+            .emit_get_index => {
+                try builder.emit(.get_index);
             },
             .emit_store => {
                 // Used by other compilation contexts
+            },
+        }
+    }
+}
+
+fn compileIf(
+    gc: Allocator,
+    arena: Allocator,
+    ast: *const Ast,
+    source: [:0]const u8,
+    interner: *StringInterner,
+    func_compiler: ?*FunctionCompiler,
+    module_compiler: ?*ModuleCompiler,
+    if_data: @FieldType(Ast.Node.Data, "if"),
+) Error!void {
+    const builder = if (func_compiler) |fc| &fc.base else if (module_compiler) |mc| &mc.base else unreachable;
+    const scope = if (func_compiler) |fc| &fc.scope else if (module_compiler) |mc| &mc.scope else unreachable;
+
+    // Compile condition
+    try compileExpr(ast, source, builder, scope, if_data.condition, func_compiler, module_compiler);
+
+    // Jump if false to else branch
+    const jump_to_else = try builder.emitJump(.jump_if_false);
+
+    // Compile then body
+    try compileBlock(gc, arena, ast, source, interner, func_compiler, module_compiler, if_data.then_body);
+
+    if (if_data.else_body != .none) {
+        // Jump over else branch
+        const jump_to_end = try builder.emitJump(.jump);
+        builder.patchJump(jump_to_else);
+
+        // Compile else body
+        try compileBlock(gc, arena, ast, source, interner, func_compiler, module_compiler, if_data.else_body);
+
+        builder.patchJump(jump_to_end);
+    } else {
+        builder.patchJump(jump_to_else);
+    }
+}
+
+fn compileFor(
+    gc: Allocator,
+    arena: Allocator,
+    ast: *const Ast,
+    source: [:0]const u8,
+    interner: *StringInterner,
+    func_compiler: ?*FunctionCompiler,
+    module_compiler: ?*ModuleCompiler,
+    for_data: @FieldType(Ast.Node.Data, "for"),
+    main_token: Token.Index,
+) Error!void {
+    const builder = if (func_compiler) |fc| &fc.base else if (module_compiler) |mc| &mc.base else unreachable;
+    const scope = if (func_compiler) |fc| &fc.scope else if (module_compiler) |mc| &mc.scope else unreachable;
+    _ = main_token;
+
+    try compileExpr(ast, source, builder, scope, for_data.iterable, func_compiler, module_compiler);
+    try builder.emit(.get_iter);
+
+    const binding_tok = ast.tokens.get(@intFromEnum(for_data.binding));
+    const binding_src = source[binding_tok.loc.start..binding_tok.loc.end];
+
+    const loop_start = builder.currentOffset();
+
+    if (func_compiler) |fc| {
+        try fc.loop_stack.append(arena, .{
+            .continue_target = loop_start,
+            .break_patches = .empty,
+        });
+    }
+
+    const for_iter_jump = try builder.emitJump(.for_iter);
+
+    if (func_compiler) |fc| {
+        const local_idx = try fc.defineLocal(binding_src);
+        try builder.emit(.{ .store = local_idx });
+    } else if (module_compiler) |mc| {
+        const global_idx = try mc.defineGlobal(binding_src);
+        try builder.emit(.{ .store_global = global_idx });
+    }
+
+    try compileBlock(gc, arena, ast, source, interner, func_compiler, module_compiler, for_data.body);
+
+    // Jump back to loop start
+    const target: i32 = @intCast(loop_start);
+    const from: i32 = @intCast(builder.currentOffset() + 1);
+    try builder.emit(.{ .jump = target - from });
+
+    // Patch for_iter to jump here when exhausted
+    builder.patchJump(for_iter_jump);
+
+    // Patch breaks
+    if (func_compiler) |fc| {
+        if (fc.loop_stack.pop()) |loop_ctx| {
+            for (loop_ctx.break_patches.items) |patch_idx| {
+                builder.patchJump(patch_idx);
+            }
+        }
+    }
+
+    try builder.emit(.pop_iter);
+}
+
+fn compileBlock(
+    gc: Allocator,
+    arena: Allocator,
+    ast: *const Ast,
+    source: [:0]const u8,
+    interner: *StringInterner,
+    func_compiler: ?*FunctionCompiler,
+    module_compiler: ?*ModuleCompiler,
+    block_idx: Ast.Node.Index,
+) Error!void {
+    const builder = if (func_compiler) |fc| &fc.base else if (module_compiler) |mc| &mc.base else unreachable;
+    const scope = if (func_compiler) |fc| &fc.scope else if (module_compiler) |mc| &mc.scope else unreachable;
+
+    const block_node = ast.nodes.get(@intFromEnum(block_idx));
+
+    // Handle if node directly (for elif chains)
+    if (block_node.data == .@"if") {
+        try compileIf(gc, arena, ast, source, interner, func_compiler, module_compiler, block_node.data.@"if");
+        return;
+    }
+
+    if (block_node.data != .block) return error.AstInvalid;
+    const statements = block_node.data.block.statements;
+
+    for (statements) |stmt_idx| {
+        const stmt_node = ast.nodes.get(@intFromEnum(stmt_idx));
+        const main_tok = ast.tokens.get(@intFromEnum(stmt_node.main_token));
+        builder.setLocFromToken(main_tok.loc);
+
+        switch (stmt_node.data) {
+            .var_definition => |v| {
+                try compileExpr(ast, source, builder, scope, v.value, func_compiler, module_compiler);
+                const binding_tok = ast.tokens.get(@intFromEnum(v.binding));
+                const binding_src = source[binding_tok.loc.start..binding_tok.loc.end];
+
+                if (func_compiler) |fc| {
+                    const local_idx = try fc.defineLocal(binding_src);
+                    try builder.emit(.{ .store = local_idx });
+                } else if (module_compiler) |mc| {
+                    const global_idx = try mc.defineGlobal(binding_src);
+                    try builder.emit(.{ .store_global = global_idx });
+                }
+            },
+            .def_proto => |d| {
+                const name_tok = ast.tokens.get(@intFromEnum(d.name));
+                const fn_name = source[name_tok.loc.start..name_tok.loc.end];
+
+                const parent_scope = if (func_compiler) |fc| &fc.scope else if (module_compiler) |mc| &mc.scope else unreachable;
+                const nested_func_obj = try compileFunction(gc, arena, ast, source, interner, parent_scope, d.body, d.args, fn_name);
+                const func_idx = try builder.addConst(&nested_func_obj.obj);
+
+                if (nested_func_obj.names_free.len > 0) {
+                    try builder.emit(.{ .make_closure = func_idx });
+                } else {
+                    try builder.emit(.{ .load_const = func_idx });
+                }
+
+                if (func_compiler) |fc| {
+                    const local_idx = try fc.defineLocal(fn_name);
+                    try builder.emit(.{ .store = local_idx });
+                } else if (module_compiler) |mc| {
+                    const global_idx = try mc.defineGlobal(fn_name);
+                    try builder.emit(.{ .store_global = global_idx });
+                }
+            },
+            .@"return" => |ret_expr_idx| {
+                try compileExpr(ast, source, builder, scope, ret_expr_idx, func_compiler, module_compiler);
+                try builder.emit(.ret);
+            },
+            .@"if" => |if_data| {
+                try compileIf(gc, arena, ast, source, interner, func_compiler, module_compiler, if_data);
+            },
+            .@"for" => |for_data| {
+                try compileFor(gc, arena, ast, source, interner, func_compiler, module_compiler, for_data, stmt_node.main_token);
+            },
+            .@"break" => {
+                if (func_compiler) |fc| {
+                    if (fc.loop_stack.items.len == 0) return error.AstInvalid;
+                    const loop_ctx = &fc.loop_stack.items[fc.loop_stack.items.len - 1];
+                    const jump_idx = try builder.emitJump(.jump);
+                    try loop_ctx.break_patches.append(arena, jump_idx);
+                } else {
+                    return error.AstInvalid;
+                }
+            },
+            .@"continue" => {
+                if (func_compiler) |fc| {
+                    if (fc.loop_stack.items.len == 0) return error.AstInvalid;
+                    const loop_ctx = fc.loop_stack.items[fc.loop_stack.items.len - 1];
+                    const target: i32 = @intCast(loop_ctx.continue_target);
+                    const from: i32 = @intCast(builder.currentOffset() + 1);
+                    try builder.emit(.{ .jump = target - from });
+                } else {
+                    return error.AstInvalid;
+                }
+            },
+            .call, .add, .sub, .mul, .eq, .ne, .lt, .le, .gt, .ge, .literal, .identifier, .list_literal, .index, .bool_not, .get_attribute => {
+                try compileExpr(ast, source, builder, scope, stmt_idx, func_compiler, module_compiler);
+                try builder.emit(.pop);
+            },
+            else => {
+                log.err("Unexpected statement in block: {any}", .{std.meta.activeTag(stmt_node.data)});
+                return error.AstInvalid;
             },
         }
     }
@@ -499,8 +771,28 @@ fn compileFunction(
                 try compileExpr(ast, source, &func_compiler.base, &func_compiler.scope, ret_expr_idx, &func_compiler, null);
                 try func_compiler.base.emit(.ret);
             },
-            .call, .add, .sub, .mul, .literal, .identifier => {
+            .@"if" => |if_data| {
+                try compileIf(gc, arena, ast, source, interner, &func_compiler, null, if_data);
+            },
+            .@"for" => |for_data| {
+                try compileFor(gc, arena, ast, source, interner, &func_compiler, null, for_data, stmt_node.main_token);
+            },
+            .@"break" => {
+                if (func_compiler.loop_stack.items.len == 0) return error.AstInvalid;
+                const loop_ctx = &func_compiler.loop_stack.items[func_compiler.loop_stack.items.len - 1];
+                const jump_idx = try func_compiler.base.emitJump(.jump);
+                try loop_ctx.break_patches.append(arena, jump_idx);
+            },
+            .@"continue" => {
+                if (func_compiler.loop_stack.items.len == 0) return error.AstInvalid;
+                const loop_ctx = func_compiler.loop_stack.items[func_compiler.loop_stack.items.len - 1];
+                const target: i32 = @intCast(loop_ctx.continue_target);
+                const from: i32 = @intCast(func_compiler.base.currentOffset() + 1);
+                try func_compiler.base.emit(.{ .jump = target - from });
+            },
+            .call, .add, .sub, .mul, .eq, .ne, .lt, .le, .gt, .ge, .literal, .identifier, .list_literal, .index, .bool_not => {
                 try compileExpr(ast, source, &func_compiler.base, &func_compiler.scope, stmt_idx, &func_compiler, null);
+                try func_compiler.base.emit(.pop);
             },
             else => {
                 log.err("Unexpected statement node: {any}", .{std.meta.activeTag(stmt_node.data)});
@@ -583,8 +875,15 @@ fn compileModule(
                 try module_compiler.base.emit(.{ .store_global = global_idx });
             },
             .@"return" => return Error.AstInvalid,
-            .call, .add, .sub, .mul, .literal, .identifier => {
+            .@"if" => |if_data| {
+                try compileIf(gc, arena, ast, source, interner, null, &module_compiler, if_data);
+            },
+            .@"for" => |for_data| {
+                try compileFor(gc, arena, ast, source, interner, null, &module_compiler, for_data, stmt_node.main_token);
+            },
+            .call, .add, .sub, .mul, .eq, .ne, .lt, .le, .gt, .ge, .literal, .identifier, .list_literal, .index, .bool_not, .get_attribute => {
                 try compileExpr(ast, source, &module_compiler.base, &module_compiler.scope, stmt_idx, null, &module_compiler);
+                try module_compiler.base.emit(.pop);
             },
             else => {
                 log.err("Unexpected top-level statement: {any}", .{std.meta.activeTag(stmt_node.data)});

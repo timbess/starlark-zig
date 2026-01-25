@@ -1,17 +1,18 @@
-msg = "Hi there!"
+# Iterate over range
+print("range iteration:")
+for i in range(3):
+    print(i)
 
-def foo():
-  def bar(a):
-    return a
-  return bar
+# Iterate over list
+print("list iteration:")
+for item in [10, 20, 30]:
+    if item != 20:
+        print(item)
 
-print("Message:", foo()(msg))
+# Nested loops
+print("nested loops:")
+for i in range(2):
+    for j in range(3):
+        print(i, j)
 
-x = 10 - 3
-print(x)
-
-y = 5 + 2
-print(y)
-
-z = 10 + 5 - 3 * 2 + 1
-print("The result is:", z)
+print("Done!")

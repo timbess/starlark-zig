@@ -31,18 +31,36 @@ pub const Token = struct {
         identifier,
         l_paren,
         r_paren,
+        l_bracket,
+        r_bracket,
         comma,
         string,
         number_literal,
         eof,
         invalid,
         eq,
+        eq_eq,
+        bang_eq,
+        lt,
+        lt_eq,
+        gt,
+        gt_eq,
         block_start,
         block_end,
         keyword_def,
         keyword_return,
         keyword_and,
         keyword_or,
+        keyword_not,
+        keyword_true,
+        keyword_false,
+        keyword_if,
+        keyword_elif,
+        keyword_else,
+        keyword_for,
+        keyword_in,
+        keyword_break,
+        keyword_continue,
         colon,
         star,
         starstar,
@@ -63,6 +81,16 @@ pub const Token = struct {
         .{ "return", .keyword_return },
         .{ "and", .keyword_and },
         .{ "or", .keyword_or },
+        .{ "not", .keyword_not },
+        .{ "True", .keyword_true },
+        .{ "False", .keyword_false },
+        .{ "if", .keyword_if },
+        .{ "elif", .keyword_elif },
+        .{ "else", .keyword_else },
+        .{ "for", .keyword_for },
+        .{ "in", .keyword_in },
+        .{ "break", .keyword_break },
+        .{ "continue", .keyword_continue },
     });
 
     pub fn getKeyword(name: []const u8) ?Tag {
@@ -124,10 +152,45 @@ pub fn next(self: *Tokenizer) Error!Token {
                     result.loc.start = self.index;
                     continue :state .start;
                 },
+                '#' => {
+                    // Skip comment until end of line
+                    while (self.source[self.index] != 0 and self.source[self.index] != '\n') {
+                        self.index += 1;
+                    }
+                    result.loc.start = self.index;
+                    continue :state .start;
+                },
                 '=' => {
-                    // TODO: Handle ==
                     self.index += 1;
                     result.tag = .eq;
+                    continue :state .operator_two_char;
+                },
+                '!' => {
+                    self.index += 1;
+                    if (self.source[self.index] == '=') {
+                        self.index += 1;
+                        result.tag = .bang_eq;
+                    } else {
+                        continue :state .invalid;
+                    }
+                },
+                '<' => {
+                    self.index += 1;
+                    result.tag = .lt;
+                    continue :state .operator_two_char;
+                },
+                '>' => {
+                    self.index += 1;
+                    result.tag = .gt;
+                    continue :state .operator_two_char;
+                },
+                '[' => {
+                    self.index += 1;
+                    result.tag = .l_bracket;
+                },
+                ']' => {
+                    self.index += 1;
+                    result.tag = .r_bracket;
                 },
                 '*' => {
                     self.index += 1;
@@ -191,9 +254,13 @@ pub fn next(self: *Tokenizer) Error!Token {
                         result.loc.start = self.index;
                         continue :state .start;
                     } else if (indent < self.indent_level) {
-                        // We don't care about capturing ws when blocks end
+                        // Emit one block_end per indent level decrease
                         result.loc.start = self.index;
-                        self.indent_level = indent;
+                        if (self.indent_size > 0) {
+                            self.indent_level -= self.indent_size;
+                        } else {
+                            self.indent_level = indent;
+                        }
                         result.tag = .block_end;
                     } else {
                         self.indent_level = indent;
@@ -299,6 +366,9 @@ pub fn next(self: *Tokenizer) Error!Token {
                     switch (result.tag) {
                         .minus => result.tag = .minus_eq,
                         .plus => result.tag = .plus_eq,
+                        .eq => result.tag = .eq_eq,
+                        .lt => result.tag = .lt_eq,
+                        .gt => result.tag = .gt_eq,
                         else => continue :state .invalid,
                     }
                     self.index += 1;

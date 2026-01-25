@@ -18,11 +18,27 @@ stack: std.ArrayList(*StarObj) = .empty,
 globals: std.StringHashMapUnmanaged(*StarObj) = .empty,
 /// Source code of current module, mostly for error reporting
 current_source: ?[:0]const u8 = null,
+/// Filename of current module,
+current_filename: ?[]const u8 = null,
 /// Optional diagnostic to populate on error
 diagnostic: ?*Diagnostic = null,
 
 const knobs = struct {
     const locals_initial_capacity: usize = 16;
+};
+
+const dunder = struct {
+    pub const eq = "__eq__";
+    pub const add = "__add__";
+    pub const sub = "__sub__";
+    pub const mul = "__mul__";
+    pub const ne = "__ne__";
+    pub const lt = "__lt__";
+    pub const le = "__le__";
+    pub const gt = "__gt__";
+    pub const ge = "__ge__";
+    pub const iter = "__iter__";
+    pub const next = "__next__";
 };
 
 pub const InitOpts = struct {
@@ -37,7 +53,7 @@ pub const FreeVarIdx = enum(u32) { _ };
 
 pub const Arity = u32;
 
-pub const BinOp = enum { add, sub, mul };
+pub const BinOp = enum { add, sub, mul, eq, ne, lt, le, gt, ge };
 
 pub const Instruction = union(enum) {
     load: LocalIdx,
@@ -47,12 +63,31 @@ pub const Instruction = union(enum) {
     store: LocalIdx,
     store_global: GlobalIdx,
     binary_op: BinOp,
+    bool_not: void,
     call: Arity,
     ret: void,
     ret_none: void,
     make_closure: ConstIdx,
     /// Slice of the identifier from the original source code.
     get_attr: []const u8,
+    /// Create a list from top N stack elements.
+    build_list: u32,
+    /// Index into object: pops index, pops object, pushes result.
+    get_index: void,
+    /// Jump unconditionally (offset relative to next instruction).
+    jump: i32,
+    /// Pop top of stack, jump if falsey (offset relative to next instruction).
+    jump_if_false: i32,
+    /// Pop top of stack, jump if truthy (offset relative to next instruction).
+    jump_if_true: i32,
+    /// Get iterator from top of stack.
+    get_iter: void,
+    /// Advance iterator: pushes next value or jumps if exhausted.
+    for_iter: i32,
+    /// Pop iterator from stack (cleanup after for loop).
+    pop_iter: void,
+    /// Pop top of stack.
+    pop: void,
 
     const Tag = std.meta.Tag(@This());
 };
@@ -77,6 +112,9 @@ pub const RuntimeError = error{
     AttributeMissing,
     GlobalUndefined,
     FreeVarOutOfRange,
+    IndexOutOfRange,
+    NotIterable,
+    TypeMismatch,
 };
 
 pub const Error = Allocator.Error || std.Io.Writer.Error || TypeError || RuntimeError;
@@ -101,6 +139,7 @@ pub const Diagnostic = struct {
     err: Error = error.FrameMissing,
     trace: []const StackTraceEntry = &.{},
     source: ?[:0]const u8 = null,
+    filename: []const u8 = "<source>",
 
     const style = struct {
         const reset = "\x1b[0m";
@@ -163,10 +202,10 @@ pub const Diagnostic = struct {
             if (self.source) |source| {
                 const loc = offsetToLineCol(source, entry.source_loc.byte_offset);
                 try writer.print(
-                    "  File " ++ style.cyan ++ "\"<source>\"" ++ style.reset ++
+                    "  File " ++ style.cyan ++ "\"{s}\"" ++ style.reset ++
                         ", line " ++ style.yellow ++ "{d}" ++ style.reset ++
                         ", in " ++ style.bold_green ++ "{s}" ++ style.reset ++ "\n",
-                    .{ loc.line, entry.func_name },
+                    .{ self.filename, loc.line, entry.func_name },
                 );
 
                 const line_content = getSourceLine(source, entry.source_loc.byte_offset);
@@ -323,6 +362,9 @@ fn fillDiagnostic(self: *Runtime, err: Error) void {
     diag.allocator = self.gpa;
     diag.err = err;
     diag.source = self.current_source;
+    if (self.current_filename) |cf| {
+        diag.filename = cf;
+    }
 
     if (self.frames.len == 0) {
         diag.trace = &.{};
@@ -332,9 +374,9 @@ fn fillDiagnostic(self: *Runtime, err: Error) void {
     var entries = std.ArrayList(StackTraceEntry).empty;
     var i: usize = 0;
     while (i < self.frames.len) : (i += 1) {
-        const frame = self.frames.at(i);
+        const frame: *Frame = self.frames.at(i);
         const func = frame.func;
-        const pc = if (frame.pc > 0) frame.pc - 1 else 0;
+        const pc = if (frame.pc > 0) frame.pc else 0;
         const source_loc = if (pc < func.source_locs.len) func.source_locs[pc] else SourceLoc.none;
 
         entries.append(self.gpa, .{ .func_name = func.name, .source_loc = source_loc }) catch {
@@ -367,10 +409,6 @@ fn step(self: *Runtime) Error!void {
     const instr = active_code[frame.pc];
     const pc = frame.pc;
 
-    defer {
-        frame.pc += 1;
-    }
-
     log.debug("[{d}] {s}", .{ pc, @tagName(instr) });
     switch (instr) {
         .load => |idx| {
@@ -401,17 +439,17 @@ fn step(self: *Runtime) Error!void {
             const rhs = try self.stackPop();
             const lhs = try self.stackPop();
 
-            const result: *StarObj = switch (op) {
-                .add => try lhs.addOp(self.gc, rhs),
-                .sub => try lhs.subOp(self.gc, rhs),
-                .mul => try lhs.mulOp(self.gc, rhs),
-            };
+            // Sorta nice that it enforces that the dunder struct must match the op name.
+            const dunder_op = switch (op) {inline else => |o| @field(std.meta.DeclEnum(dunder), @tagName(o))};
+
+            const bound_method = try lhs.getMethodDunder(dunder_op) orelse return Error.AddOpUndefined;
+            const result = try bound_method.call(self.gc, &.{rhs});
 
             try self.stackPush(result);
         },
         .get_attr => |attr| {
             const obj = try self.stackPop();
-            const val = obj.attributes.get(attr) orelse return Error.AttributeMissing;
+            const val = try obj.getAttrStr(attr) orelse return Error.AttributeMissing;
             try self.stackPush(val);
         },
         .call => |arity_u| {
@@ -436,9 +474,15 @@ fn step(self: *Runtime) Error!void {
 
             if (maybe_func) |fptr| {
                 if (fptr.native_fn) |f| {
-                    try self.stackPush(try f(self, args_slice));
+                    const result = try f(self, args_slice);
+                    self.stack.shrinkRetainingCapacity(func_index);
+                    try self.stackPush(result);
                 } else try self.callFn(fptr, args_slice);
-            } else {
+            } else if (downCast(StarBoundMethod, func_obj)) |bm| {
+                const result = try bm.call(self.gc, args_slice);
+                self.stack.shrinkRetainingCapacity(func_index);
+                try self.stackPush(result);
+            } else |_| {
                 return RuntimeError.CallUndefined;
             }
         },
@@ -506,6 +550,73 @@ fn step(self: *Runtime) Error!void {
 
             try self.stackPush(&closure_func.obj);
         },
+        .bool_not => {
+            const val = try self.stackPop();
+            try self.stackPush(StarBool.get(!val.isTruthy()));
+        },
+        .build_list => |count| {
+            const sp = self.stack.items.len;
+            if (sp < count) return RuntimeError.StackUnderflow;
+            const start = sp - count;
+            const elements = self.stack.items[start..sp];
+            const list = try StarList.init(self.gc, elements);
+            self.stack.shrinkRetainingCapacity(start);
+            try self.stackPush(&list.obj);
+        },
+        .get_index => {
+            const idx_obj = try self.stackPop();
+            const obj = try self.stackPop();
+
+            const list = downCast(StarList, obj) catch return TypeError.TypeMismatch;
+            const idx_int = try downCast(StarInt, idx_obj);
+            const val = try list.getItem(@intCast(idx_int.num));
+            try self.stackPush(val);
+        },
+        .jump => |offset| {
+            const new_pc: i64 = @as(i64, @intCast(frame.pc)) + 1 + offset;
+            frame.pc = @intCast(new_pc);
+            return;
+        },
+        .jump_if_false => |offset| {
+            const val = try self.stackPop();
+            if (!val.isTruthy()) {
+                const new_pc: i64 = @as(i64, @intCast(frame.pc)) + 1 + offset;
+                frame.pc = @intCast(new_pc);
+                return;
+            }
+        },
+        .jump_if_true => |offset| {
+            const val = try self.stackPop();
+            if (val.isTruthy()) {
+                const new_pc: i64 = @as(i64, @intCast(frame.pc)) + 1 + offset;
+                frame.pc = @intCast(new_pc);
+                return;
+            }
+        },
+        .get_iter => {
+            const obj = try self.stackPop();
+            const bound = try obj.getMethodDunder(.iter) orelse return RuntimeError.NotIterable;
+            const iter_obj = try bound.call(self.gc, &.{});
+            try self.stackPush(iter_obj);
+        },
+        .for_iter => |offset| {
+            const iter_obj = self.stack.items[self.stack.items.len - 1];
+            const bound = try iter_obj.getMethodDunder(.next) orelse return RuntimeError.NotIterable;
+            const val = try bound.call(self.gc, &.{});
+
+            if (val == StarStopIteration.instance) {
+                const new_pc: i64 = @as(i64, @intCast(frame.pc)) + 1 + offset;
+                frame.pc = @intCast(new_pc);
+                return;
+            }
+            try self.stackPush(val);
+        },
+        .pop_iter => {
+            _ = try self.stackPop();
+        },
+        .pop => {
+            _ = try self.stackPop();
+        },
         .ret, .ret_none => {
             var frame_val = self.frames.pop() orelse return error.ReturnedOutsideFunction;
             frame_val.locals.deinit(self.gpa);
@@ -517,8 +628,10 @@ fn step(self: *Runtime) Error!void {
             std.debug.assert(new_sp >= 0);
             self.stack.shrinkRetainingCapacity(new_sp);
             try self.stackPush(return_value);
+            return; // Don't increment PC after ret
         },
     }
+    frame.pc += 1;
 }
 
 /// Inefficient and not ideal. Should only be used when the scope where a variable lives
@@ -552,7 +665,11 @@ pub fn takeOwnedGlobals(self: *Runtime) std.StringHashMapUnmanaged(*StarObj) {
 
 pub fn execModule(self: *Runtime, module: *const Compiler.Module) Error!void {
     const mod = try StarModule.fromCompiledModule(self.gc, module);
+    // TODO: These don't get automatically cleared, I'm not sure if defer
+    //       setting them to null is the right move since you may want to recover
+    //       on errors.
     self.current_source = module.source;
+    self.current_filename = module.module_name;
 
     std.debug.assert(mod.init_fn.arity == 0);
     try self.stackPush(&mod.init_fn.obj);
@@ -566,57 +683,96 @@ pub const StarInt = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
-            .add_op = &addOp,
-            .sub_op = &subOp,
-            .mul_op = &mulOp,
-            .str = &str,
+            .str = &strFn,
         },
     },
 
     pub fn init(allocator: Allocator, num: u64) !*StarInt {
         const self = try allocator.create(StarInt);
         self.* = .{ .num = num };
+        try self.obj.attributes.put(allocator, dunder.add, &(try StarBoundMethod.init(allocator, &self.obj, &add)).obj);
+        try self.obj.attributes.put(allocator, dunder.sub, &(try StarBoundMethod.init(allocator, &self.obj, &sub)).obj);
+        try self.obj.attributes.put(allocator, dunder.mul, &(try StarBoundMethod.init(allocator, &self.obj, &mul)).obj);
+        try self.obj.attributes.put(allocator, dunder.eq, &(try StarBoundMethod.init(allocator, &self.obj, &eqFn)).obj);
+        try self.obj.attributes.put(allocator, dunder.ne, &(try StarBoundMethod.init(allocator, &self.obj, &neFn)).obj);
+        try self.obj.attributes.put(allocator, dunder.lt, &(try StarBoundMethod.init(allocator, &self.obj, &ltFn)).obj);
+        try self.obj.attributes.put(allocator, dunder.le, &(try StarBoundMethod.init(allocator, &self.obj, &leFn)).obj);
+        try self.obj.attributes.put(allocator, dunder.gt, &(try StarBoundMethod.init(allocator, &self.obj, &gtFn)).obj);
+        try self.obj.attributes.put(allocator, dunder.ge, &(try StarBoundMethod.init(allocator, &self.obj, &geFn)).obj);
         return self;
     }
 
-    fn addOp(vt: *StarObj.Vtable, allocator: Allocator, other: *StarObj) Error!*StarObj {
-        // Find the StarInt that owns this vtable:
-        const owner_starobj = vt.basePtr(); // *StarObj
-        const self_int: *StarInt = @fieldParentPtr("obj", owner_starobj);
-
-        const o = try downCast(StarInt, other);
-
-        const new = try StarInt.init(allocator, self_int.num + o.num);
-        return &new.obj;
+    fn add(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarInt = @fieldParentPtr("obj", self_obj);
+        const other = try downCast(StarInt, args[0]);
+        const result = try StarInt.init(allocator, self.num + other.num);
+        return &result.obj;
     }
 
-    fn subOp(vt: *StarObj.Vtable, allocator: Allocator, other: *StarObj) Error!*StarObj {
-        const owner_starobj = vt.basePtr();
-        const self_int: *StarInt = @fieldParentPtr("obj", owner_starobj);
-
-        const o = try downCast(StarInt, other);
-
-        const new = try StarInt.init(allocator, self_int.num - o.num);
-        return &new.obj;
+    fn sub(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarInt = @fieldParentPtr("obj", self_obj);
+        const other = try downCast(StarInt, args[0]);
+        const result = try StarInt.init(allocator, self.num - other.num);
+        return &result.obj;
     }
 
-    fn mulOp(vt: *StarObj.Vtable, allocator: Allocator, other: *StarObj) Error!*StarObj {
-        const owner_starobj = vt.basePtr();
-        const self_int: *StarInt = @fieldParentPtr("obj", owner_starobj);
-
-        const o = try downCast(StarInt, other);
-
-        const new = try StarInt.init(allocator, self_int.num * o.num);
-        return &new.obj;
+    fn mul(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarInt = @fieldParentPtr("obj", self_obj);
+        const other = try downCast(StarInt, args[0]);
+        const result = try StarInt.init(allocator, self.num * other.num);
+        return &result.obj;
     }
 
-    fn str(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
-        const owner_starobj = vt.basePtr();
-        const self_int: *StarInt = @fieldParentPtr("obj", owner_starobj);
+    fn eqFn(_: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarInt = @fieldParentPtr("obj", self_obj);
+        const other = try downCast(StarInt, args[0]);
+        return StarBool.get(self.num == other.num);
+    }
 
-        const str_val = try std.fmt.allocPrint(allocator, "{d}", .{self_int.num});
-        const new = try allocator.create(StarStr);
-        new.* = .{ .str = str_val };
+    fn neFn(_: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarInt = @fieldParentPtr("obj", self_obj);
+        const other = try downCast(StarInt, args[0]);
+        return StarBool.get(self.num != other.num);
+    }
+
+    fn ltFn(_: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarInt = @fieldParentPtr("obj", self_obj);
+        const other = try downCast(StarInt, args[0]);
+        return StarBool.get(self.num < other.num);
+    }
+
+    fn leFn(_: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarInt = @fieldParentPtr("obj", self_obj);
+        const other = try downCast(StarInt, args[0]);
+        return StarBool.get(self.num <= other.num);
+    }
+
+    fn gtFn(_: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarInt = @fieldParentPtr("obj", self_obj);
+        const other = try downCast(StarInt, args[0]);
+        return StarBool.get(self.num > other.num);
+    }
+
+    fn geFn(_: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarInt = @fieldParentPtr("obj", self_obj);
+        const other = try downCast(StarInt, args[0]);
+        return StarBool.get(self.num >= other.num);
+    }
+
+    fn strFn(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
+        const owner_starobj = vt.basePtr();
+        const self: *StarInt = @fieldParentPtr("obj", owner_starobj);
+        const str_val = try std.fmt.allocPrint(allocator, "{d}", .{self.num});
+        const new = try StarStr.init(allocator, str_val);
         return &new.obj;
     }
 };
@@ -626,57 +782,48 @@ pub const StarFloat = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
-            .add_op = &addOp,
-            .sub_op = &subOp,
-            .mul_op = &mulOp,
-            .str = &str,
+            .str = &strFn,
         },
     },
 
     pub fn init(allocator: Allocator, num: f64) !*StarFloat {
         const self = try allocator.create(StarFloat);
         self.* = .{ .num = num };
+        try self.obj.attributes.put(allocator, dunder.add, &(try StarBoundMethod.init(allocator, &self.obj, &add)).obj);
+        try self.obj.attributes.put(allocator, dunder.sub, &(try StarBoundMethod.init(allocator, &self.obj, &sub)).obj);
+        try self.obj.attributes.put(allocator, dunder.mul, &(try StarBoundMethod.init(allocator, &self.obj, &mul)).obj);
         return self;
     }
 
-    fn addOp(vt: *StarObj.Vtable, allocator: Allocator, other: *StarObj) Error!*StarObj {
-        // Find the StarFloat that owns this vtable:
-        const owner_starobj = vt.basePtr(); // *StarObj
-        const self_int: *StarFloat = @fieldParentPtr("obj", owner_starobj);
-
-        const o = try downCast(StarFloat, other);
-
-        const new = try StarFloat.init(allocator, self_int.num + o.num);
-        return &new.obj;
+    fn add(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarFloat = @fieldParentPtr("obj", self_obj);
+        const other = try downCast(StarFloat, args[0]);
+        const result = try StarFloat.init(allocator, self.num + other.num);
+        return &result.obj;
     }
 
-    fn subOp(vt: *StarObj.Vtable, allocator: Allocator, other: *StarObj) Error!*StarObj {
-        const owner_starobj = vt.basePtr();
-        const self_float: *StarFloat = @fieldParentPtr("obj", owner_starobj);
-
-        const o = try downCast(StarFloat, other);
-
-        const new = try StarFloat.init(allocator, self_float.num - o.num);
-        return &new.obj;
+    fn sub(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarFloat = @fieldParentPtr("obj", self_obj);
+        const other = try downCast(StarFloat, args[0]);
+        const result = try StarFloat.init(allocator, self.num - other.num);
+        return &result.obj;
     }
 
-    fn mulOp(vt: *StarObj.Vtable, allocator: Allocator, other: *StarObj) Error!*StarObj {
-        const owner_starobj = vt.basePtr();
-        const self_float: *StarFloat = @fieldParentPtr("obj", owner_starobj);
-
-        const o = try downCast(StarFloat, other);
-
-        const new = try StarFloat.init(allocator, self_float.num * o.num);
-        return &new.obj;
+    fn mul(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarFloat = @fieldParentPtr("obj", self_obj);
+        const other = try downCast(StarFloat, args[0]);
+        const result = try StarFloat.init(allocator, self.num * other.num);
+        return &result.obj;
     }
 
-    fn str(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
+    fn strFn(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
         const owner_starobj = vt.basePtr();
-        const self_float: *StarFloat = @fieldParentPtr("obj", owner_starobj);
-
-        const str_val = try std.fmt.allocPrint(allocator, "{d}", .{self_float.num});
-        const new = try allocator.create(StarStr);
-        new.* = .{ .str = str_val };
+        const self: *StarFloat = @fieldParentPtr("obj", owner_starobj);
+        const str_val = try std.fmt.allocPrint(allocator, "{d}", .{self.num});
+        const new = try StarStr.init(allocator, str_val);
         return &new.obj;
     }
 };
@@ -690,10 +837,26 @@ pub const StarStr = struct {
         },
     },
 
-    pub fn init_dupe(allocator: Allocator, str: []const u8) !*StarStr {
+    pub fn init(allocator: Allocator, s: []const u8) !*StarStr {
         const self = try allocator.create(StarStr);
-        self.* = .{ .str = try allocator.dupe(u8, str) };
+        self.* = .{ .str = s };
+        try self.obj.attributes.put(allocator, "upper", &(try StarBoundMethod.init(allocator, &self.obj, &upper)).obj);
         return self;
+    }
+
+    pub fn init_dupe(allocator: Allocator, s: []const u8) !*StarStr {
+        return StarStr.init(allocator, try allocator.dupe(u8, s));
+    }
+
+    fn upper(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
+        const self: *StarStr = @fieldParentPtr("obj", self_obj);
+        const upper_str = try allocator.alloc(u8, self.str.len);
+        for (self.str, 0..) |c, i| {
+            upper_str[i] = std.ascii.toUpper(c);
+        }
+        const new = try StarStr.init(allocator, upper_str);
+        return &new.obj;
     }
 
     fn strFn(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
@@ -714,7 +877,8 @@ test "Basic StarObject usage works" {
     var b = try StarInt.init(gc, 6);
     const b_obj = &b.obj;
 
-    const c_obj = try a_obj.addOp(gc, b_obj);
+    const add_method = try a_obj.getMethodDunder(.add) orelse return error.TestExpectedEqual;
+    const c_obj = try add_method.call(gc, &.{b_obj});
     const c = try downCast(StarInt, c_obj);
 
     try std.testing.expectEqual(11, c.num);
@@ -791,7 +955,7 @@ pub const StarFunc = struct {
     /// Source locations parallel to code, maps each instruction to source
     source_locs: []const SourceLoc = &.{},
 
-    native_fn: ?*const fn (rt: *Runtime, args: []*StarObj) Error!*StarObj = null,
+    native_fn: ?*const fn (rt: *Runtime, args: []const *StarObj) Error!*StarObj = null,
 
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
@@ -813,10 +977,10 @@ pub const StarFunc = struct {
         Args: type,
         comptime native: fn (rt: *Runtime, args: Args) Error!?*StarObj,
     ) StarFunc {
-        // Handle variadic args: []*StarObj
-        if (Args == []*StarObj) {
+        // Handle variadic args: []const *StarObj
+        if (Args == []const *StarObj) {
             const native_fn = struct {
-                pub fn wrapper(rt: *Runtime, args: []*StarObj) Error!*StarObj {
+                pub fn wrapper(rt: *Runtime, args: []const *StarObj) Error!*StarObj {
                     const res = try native(rt, args);
                     if (res) |r| return r;
                     return StarNone.instance;
@@ -834,7 +998,7 @@ pub const StarFunc = struct {
             .@"struct" => |s| {
                 const arity = s.fields.len;
                 const native_fn = struct {
-                    pub fn wrapper(rt: *Runtime, args: []*StarObj) Error!*StarObj {
+                    pub fn wrapper(rt: *Runtime, args: []const *StarObj) Error!*StarObj {
                         var parsed_args: Args = undefined;
                         if (args.len != arity) return Error.ArityMismatch;
                         inline for (s.fields, 0..) |field, i| {
@@ -892,6 +1056,239 @@ pub const StarNone = struct {
     var none_str = StarStr{ .str = "None" };
 };
 
+pub const StarStopIteration = struct {
+    obj: StarObj = .{
+        .vtable = StarObj.Vtable{
+            .name = @typeName(@This()),
+            .str = &str,
+        },
+    },
+
+    fn str(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
+        _ = vt;
+        _ = allocator;
+        return &stop_str.obj;
+    }
+
+    var stop_obj = StarStopIteration{};
+    pub const instance: *StarObj = &stop_obj.obj;
+
+    var stop_str = StarStr{ .str = "<StopIteration>" };
+};
+
+pub const StarBool = struct {
+    value: bool,
+    obj: StarObj = .{
+        .vtable = StarObj.Vtable{
+            .name = @typeName(@This()),
+            .str = &strFn,
+        },
+    },
+
+    pub fn init(allocator: Allocator, value: bool) !*StarBool {
+        const self = try allocator.create(StarBool);
+        self.* = .{ .value = value };
+        return self;
+    }
+
+    pub fn get(value: bool) *StarObj {
+        if (value) return &true_obj.obj else return &false_obj.obj;
+    }
+
+    fn strFn(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
+        _ = allocator;
+        const owner_starobj = vt.basePtr();
+        const self: *StarBool = @fieldParentPtr("obj", owner_starobj);
+        if (self.value) return &true_str.obj else return &false_str.obj;
+    }
+
+    var true_obj = StarBool{ .value = true };
+    var false_obj = StarBool{ .value = false };
+    var true_str = StarStr{ .str = "True" };
+    var false_str = StarStr{ .str = "False" };
+};
+
+pub const StarList = struct {
+    items: std.ArrayList(*StarObj),
+    obj: StarObj = .{
+        .vtable = StarObj.Vtable{
+            .name = @typeName(@This()),
+            .str = &strFn,
+        },
+    },
+
+    pub fn init(allocator: Allocator, items: []const *StarObj) !*StarList {
+        const self = try allocator.create(StarList);
+        var list = std.ArrayList(*StarObj).empty;
+        try list.appendSlice(allocator, items);
+        self.* = .{ .items = list };
+        try self.obj.attributes.put(allocator, "append", &(try StarBoundMethod.init(allocator, &self.obj, &append)).obj);
+        try self.obj.attributes.put(allocator, dunder.iter, &(try StarBoundMethod.init(allocator, &self.obj, &iter)).obj);
+        return self;
+    }
+
+    pub fn getItem(self: *StarList, idx: i64) Error!*StarObj {
+        const len: i64 = @intCast(self.items.items.len);
+        var actual_idx = idx;
+        if (actual_idx < 0) actual_idx += len;
+        if (actual_idx < 0 or actual_idx >= len) return error.IndexOutOfRange;
+        return self.items.items[@intCast(actual_idx)];
+    }
+
+    fn strFn(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
+        const owner_starobj = vt.basePtr();
+        const self: *StarList = @fieldParentPtr("obj", owner_starobj);
+
+        var buf = std.ArrayList(u8).empty;
+        try buf.append(allocator, '[');
+
+        for (self.items.items, 0..) |item, i| {
+            if (i > 0) try buf.appendSlice(allocator, ", ");
+            if (item.vtable.str) |str_fn| {
+                const str_obj = try str_fn(&item.vtable, allocator);
+                const str_val = try downCast(StarStr, str_obj);
+                try buf.appendSlice(allocator, str_val.str);
+            } else {
+                try buf.appendSlice(allocator, "<object>");
+            }
+        }
+
+        try buf.append(allocator, ']');
+        const new = try StarStr.init(allocator, buf.items);
+        return &new.obj;
+    }
+
+    fn append(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarList = @fieldParentPtr("obj", self_obj);
+        try self.items.append(allocator, args[0]);
+        return StarNone.instance;
+    }
+
+    fn iter(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
+        const self: *StarList = @fieldParentPtr("obj", self_obj);
+        const list_iter = try StarListIter.init(allocator, self);
+        return &list_iter.obj;
+    }
+};
+
+pub const StarRangeIter = struct {
+    current: i64,
+    stop: i64,
+    step: i64,
+    obj: StarObj = .{
+        .vtable = StarObj.Vtable{
+            .name = @typeName(@This()),
+            .str = &strFn,
+        },
+    },
+
+    pub fn init(allocator: Allocator, start: i64, stop: i64, step_val: i64) !*StarRangeIter {
+        const self = try allocator.create(StarRangeIter);
+        self.* = .{ .current = start, .stop = stop, .step = step_val };
+        try self.obj.attributes.put(allocator, dunder.iter, &(try StarBoundMethod.init(allocator, &self.obj, &iter)).obj);
+        try self.obj.attributes.put(allocator, dunder.next, &(try StarBoundMethod.init(allocator, &self.obj, &nextFn)).obj);
+        return self;
+    }
+
+    fn iter(_: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
+        return self_obj;
+    }
+
+    fn nextFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
+        const self: *StarRangeIter = @fieldParentPtr("obj", self_obj);
+        if (self.step > 0 and self.current >= self.stop) return StarStopIteration.instance;
+        if (self.step < 0 and self.current <= self.stop) return StarStopIteration.instance;
+        const val = try StarInt.init(allocator, @intCast(self.current));
+        self.current += self.step;
+        return &val.obj;
+    }
+
+    fn strFn(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
+        _ = vt;
+        _ = allocator;
+        return &range_iter_str.obj;
+    }
+
+    var range_iter_str = StarStr{ .str = "<range_iterator>" };
+};
+
+pub const StarListIter = struct {
+    list: *StarList,
+    index: usize,
+    obj: StarObj = .{
+        .vtable = StarObj.Vtable{
+            .name = @typeName(@This()),
+            .str = &strFn,
+        },
+    },
+
+    pub fn init(allocator: Allocator, list: *StarList) !*StarListIter {
+        const self = try allocator.create(StarListIter);
+        self.* = .{ .list = list, .index = 0 };
+
+        try self.obj.attributes.put(allocator, dunder.iter, &(try StarBoundMethod.init(allocator, &self.obj, &iter)).obj);
+        try self.obj.attributes.put(allocator, dunder.next, &(try StarBoundMethod.init(allocator, &self.obj, &nextFn)).obj);
+        return self;
+    }
+
+    fn iter(_: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
+        return self_obj;
+    }
+
+    fn nextFn(_: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
+        const self: *StarListIter = @fieldParentPtr("obj", self_obj);
+        if (self.index >= self.list.items.items.len) return StarStopIteration.instance;
+        const val = self.list.items.items[self.index];
+        self.index += 1;
+        return val;
+    }
+
+    fn strFn(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
+        _ = vt;
+        _ = allocator;
+        return &list_iter_str.obj;
+    }
+
+    var list_iter_str = StarStr{ .str = "<list_iterator>" };
+};
+
+pub const MethodFn = *const fn (allocator: Allocator, self: *StarObj, args: []const *StarObj) Error!*StarObj;
+
+pub const StarBoundMethod = struct {
+    bound_self: *StarObj,
+    func: MethodFn,
+    obj: StarObj = .{
+        .vtable = StarObj.Vtable{
+            .name = @typeName(@This()),
+            .str = &strFn,
+        },
+    },
+
+    fn strFn(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
+        _ = vt;
+        _ = allocator;
+        return &bound_method_str.obj;
+    }
+
+    var bound_method_str = StarStr{ .str = "<bound method>" };
+
+    pub fn init(allocator: Allocator, bound_self: *StarObj, func: MethodFn) !*StarBoundMethod {
+        const bm = try allocator.create(StarBoundMethod);
+        bm.* = .{ .bound_self = bound_self, .func = func };
+        return bm;
+    }
+
+    pub fn call(self: *StarBoundMethod, allocator: Allocator, args: []const *StarObj) Error!*StarObj {
+        return self.func(allocator, self.bound_self, args);
+    }
+};
+
 pub const StarModule = struct {
     name: []const u8,
     init_fn: StarFunc,
@@ -907,8 +1304,7 @@ pub const StarModule = struct {
         const self_module: *StarModule = @fieldParentPtr("obj", owner_starobj);
 
         const str_val = try std.fmt.allocPrint(allocator, "<module '{s}'>", .{self_module.name});
-        const new = try allocator.create(StarStr);
-        new.* = .{ .str = str_val };
+        const new = try StarStr.init(allocator, str_val);
         return &new.obj;
     }
 
@@ -947,12 +1343,6 @@ pub const StarObj = struct {
 
     pub const Vtable = struct {
         name: []const u8,
-        // optional add operator
-        add_op: ?*const fn (*Vtable, allocator: Allocator, other: *StarObj) Error!*StarObj = null,
-        // optional sub operator
-        sub_op: ?*const fn (*Vtable, allocator: Allocator, other: *StarObj) Error!*StarObj = null,
-        // optional mul operator
-        mul_op: ?*const fn (*Vtable, allocator: Allocator, other: *StarObj) Error!*StarObj = null,
         // optional str method for string representation
         str: ?*const fn (*Vtable, allocator: Allocator) Error!*StarObj = null,
 
@@ -961,17 +1351,9 @@ pub const StarObj = struct {
         }
     };
 
-    pub fn setAttrConcrete(self: *StarObj, allocator: Allocator, name: *StarStr, value: *StarObj) Allocator.Error!void {
-        try self.attributes.put(allocator, name.str, value);
-    }
-
     pub fn setAttr(self: *StarObj, allocator: Allocator, name: *StarObj, value: *StarObj) Error!void {
         const n = try downCast(StarStr, name);
         try self.attributes.put(allocator, n.str, value);
-    }
-
-    pub fn getAttrConcrete(self: *StarObj, name: *StarStr) Error!*StarObj {
-        return self.attributes.get(name.str) orelse return error.AttributeMissing;
     }
 
     pub fn getAttr(self: *StarObj, name: *StarObj) Error!*StarObj {
@@ -979,25 +1361,41 @@ pub const StarObj = struct {
         return self.attributes.get(n.str) orelse return error.AttributeMissing;
     }
 
-    pub fn addOp(self: *StarObj, allocator: Allocator, other: *StarObj) Error!*StarObj {
-        if (self.vtable.add_op) |f| {
-            return try f(&self.vtable, allocator, other);
-        }
-        return RuntimeError.AddOpUndefined;
+    pub fn getAttrStr(self: *StarObj, name: []const u8) Error!?*StarObj {
+        if (self.attributes.get(name)) |val| return val;
+        return null;
     }
 
-    pub fn subOp(self: *StarObj, allocator: Allocator, other: *StarObj) Error!*StarObj {
-        if (self.vtable.sub_op) |f| {
-            return try f(&self.vtable, allocator, other);
-        }
-        return RuntimeError.SubOpUndefined;
+    pub fn getMethodDunder(self: *StarObj, op: std.meta.DeclEnum(dunder)) Error!?*StarBoundMethod {
+        const method_name = switch (op) {
+            inline else => |tag| @field(dunder, @tagName(tag)),
+        };
+        const method_obj = try self.getAttrStr(method_name) orelse return null;
+        return downCast(StarBoundMethod, method_obj) catch null;
     }
 
-    pub fn mulOp(self: *StarObj, allocator: Allocator, other: *StarObj) Error!*StarObj {
-        if (self.vtable.mul_op) |f| {
-            return try f(&self.vtable, allocator, other);
-        }
-        return RuntimeError.MulOpUndefined;
+    pub fn isTruthy(self: *StarObj) bool {
+        if (downCast(StarBool, self)) |b| {
+            return b.value;
+        } else |_| {}
+
+        if (downCast(StarNone, self)) |_| {
+            return false;
+        } else |_| {}
+
+        if (downCast(StarInt, self)) |i| {
+            return i.num != 0;
+        } else |_| {}
+
+        if (downCast(StarStr, self)) |s| {
+            return s.str.len > 0;
+        } else |_| {}
+
+        if (downCast(StarList, self)) |l| {
+            return l.items.items.len > 0;
+        } else |_| {}
+
+        return true;
     }
 };
 
@@ -1116,7 +1514,7 @@ test "StarObj.getAttr fails on wrong type key" {
     try std.testing.expectError(TypeError.TypeMismatch, obj.obj.getAttr(&not_a_str.obj));
 }
 
-test "StarInt addOp fails with wrong type" {
+test "StarInt add fails with wrong type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const gc = arena.allocator();
@@ -1124,7 +1522,8 @@ test "StarInt addOp fails with wrong type" {
     var a = try StarInt.init(gc, 10);
     var b = StarStr{ .str = "oops" };
 
-    try std.testing.expectError(TypeError.TypeMismatch, a.obj.addOp(gc, &b.obj));
+    const add_method = try a.obj.getMethodDunder(.add) orelse return error.TestExpectedEqual;
+    try std.testing.expectError(TypeError.TypeMismatch, add_method.call(gc, &.{&b.obj}));
 }
 
 test "downCast fails for wrong vtable" {
