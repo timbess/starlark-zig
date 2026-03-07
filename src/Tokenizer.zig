@@ -33,6 +33,8 @@ pub const Token = struct {
         r_paren,
         l_bracket,
         r_bracket,
+        l_brace,
+        r_brace,
         comma,
         string,
         number_literal,
@@ -191,6 +193,14 @@ pub fn next(self: *Tokenizer) Error!Token {
                 ']' => {
                     self.index += 1;
                     result.tag = .r_bracket;
+                },
+                '{' => {
+                    self.index += 1;
+                    result.tag = .l_brace;
+                },
+                '}' => {
+                    self.index += 1;
+                    result.tag = .r_brace;
                 },
                 '*' => {
                     self.index += 1;
@@ -495,6 +505,21 @@ test Tokenizer {
         try Test.expectToken(&tokenizer, .{ .tag = .number_literal, .text = "1" });
         try Test.expectToken(&tokenizer, .{ .tag = .block_end,      .text = "" });
         try Test.expectToken(&tokenizer, .{ .tag = .eof,            .text = "" });
+        // zig fmt: on
+    }
+    {
+        const code: [:0]const u8 =
+            \\{"foo": 123}
+        ;
+
+        var tokenizer = Tokenizer.init(code);
+
+        // zig fmt: off
+        try Test.expectToken(&tokenizer, .{ .tag = .l_brace,        .text = "{" });
+        try Test.expectToken(&tokenizer, .{ .tag = .string,         .text = "\"foo\"" });
+        try Test.expectToken(&tokenizer, .{ .tag = .colon,          .text = ":" });
+        try Test.expectToken(&tokenizer, .{ .tag = .number_literal, .text = "123" });
+        try Test.expectToken(&tokenizer, .{ .tag = .r_brace,        .text = "}" });
         // zig fmt: on
     }
 }

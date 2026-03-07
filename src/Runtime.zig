@@ -27,7 +27,7 @@ const knobs = struct {
     const locals_initial_capacity: usize = 16;
 };
 
-const dunder = struct {
+pub const dunder = struct {
     pub const eq = "__eq__";
     pub const add = "__add__";
     pub const sub = "__sub__";
@@ -39,6 +39,7 @@ const dunder = struct {
     pub const ge = "__ge__";
     pub const iter = "__iter__";
     pub const next = "__next__";
+    pub const str = "__str__";
 };
 
 pub const InitOpts = struct {
@@ -72,6 +73,8 @@ pub const Instruction = union(enum) {
     get_attr: []const u8,
     /// Create a list from top N stack elements.
     build_list: u32,
+    /// Create a dict from top N key-value pairs (2*N elements on stack).
+    build_dict: u32,
     /// Index into object: pops index, pops object, pushes result.
     get_index: void,
     /// Jump unconditionally (offset relative to next instruction).
@@ -279,6 +282,13 @@ const Frame = struct {
 const Runtime = @This();
 
 pub fn init(gpa: Allocator, opts: InitOpts) !Runtime {
+    // TODO: This isn't super ideal given that multiple Runtimes will share these globals.
+    //       The options are:
+    //          1. Attach them to the runtime and pass it around _everywhere_.
+    //          2. Make them thread local and only allow a Runtime per thread.
+    try StarNone.initAttributes(opts.gc);
+    try StarBool.initAttributes(opts.gc);
+    try StarStopIteration.initAttributes(opts.gc);
     return Runtime{
         .gpa = gpa,
         .gc = opts.gc,
@@ -563,6 +573,16 @@ fn step(self: *Runtime) Error!void {
             self.stack.shrinkRetainingCapacity(start);
             try self.stackPush(&list.obj);
         },
+        .build_dict => |count| {
+            const sp = self.stack.items.len;
+            const total = count * 2;
+            if (sp < total) return RuntimeError.StackUnderflow;
+            const start = sp - total;
+            const pairs = self.stack.items[start..sp];
+            const dict = try StarDict.init(self.gc, pairs);
+            self.stack.shrinkRetainingCapacity(start);
+            try self.stackPush(&dict.obj);
+        },
         .get_index => {
             const idx_obj = try self.stackPop();
             const obj = try self.stackPop();
@@ -683,7 +703,6 @@ pub const StarInt = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
-            .str = &strFn,
         },
     },
 
@@ -699,6 +718,7 @@ pub const StarInt = struct {
         try self.obj.attributes.put(allocator, dunder.le, &(try StarBoundMethod.init(allocator, &self.obj, &leFn)).obj);
         try self.obj.attributes.put(allocator, dunder.gt, &(try StarBoundMethod.init(allocator, &self.obj, &gtFn)).obj);
         try self.obj.attributes.put(allocator, dunder.ge, &(try StarBoundMethod.init(allocator, &self.obj, &geFn)).obj);
+        try self.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &self.obj, &strFn)).obj);
         return self;
     }
 
@@ -768,9 +788,9 @@ pub const StarInt = struct {
         return StarBool.get(self.num >= other.num);
     }
 
-    fn strFn(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
-        const owner_starobj = vt.basePtr();
-        const self: *StarInt = @fieldParentPtr("obj", owner_starobj);
+    fn strFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
+        const self: *StarInt = @fieldParentPtr("obj", self_obj);
         const str_val = try std.fmt.allocPrint(allocator, "{d}", .{self.num});
         const new = try StarStr.init(allocator, str_val);
         return &new.obj;
@@ -782,7 +802,6 @@ pub const StarFloat = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
-            .str = &strFn,
         },
     },
 
@@ -792,6 +811,7 @@ pub const StarFloat = struct {
         try self.obj.attributes.put(allocator, dunder.add, &(try StarBoundMethod.init(allocator, &self.obj, &add)).obj);
         try self.obj.attributes.put(allocator, dunder.sub, &(try StarBoundMethod.init(allocator, &self.obj, &sub)).obj);
         try self.obj.attributes.put(allocator, dunder.mul, &(try StarBoundMethod.init(allocator, &self.obj, &mul)).obj);
+        try self.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &self.obj, &strFn)).obj);
         return self;
     }
 
@@ -819,9 +839,9 @@ pub const StarFloat = struct {
         return &result.obj;
     }
 
-    fn strFn(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
-        const owner_starobj = vt.basePtr();
-        const self: *StarFloat = @fieldParentPtr("obj", owner_starobj);
+    fn strFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
+        const self: *StarFloat = @fieldParentPtr("obj", self_obj);
         const str_val = try std.fmt.allocPrint(allocator, "{d}", .{self.num});
         const new = try StarStr.init(allocator, str_val);
         return &new.obj;
@@ -833,7 +853,6 @@ pub const StarStr = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
-            .str = &strFn,
         },
     },
 
@@ -841,6 +860,7 @@ pub const StarStr = struct {
         const self = try allocator.create(StarStr);
         self.* = .{ .str = s };
         try self.obj.attributes.put(allocator, "upper", &(try StarBoundMethod.init(allocator, &self.obj, &upper)).obj);
+        try self.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &self.obj, &strFn)).obj);
         return self;
     }
 
@@ -859,10 +879,9 @@ pub const StarStr = struct {
         return &new.obj;
     }
 
-    fn strFn(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
-        _ = allocator;
-        const owner_starobj = vt.basePtr();
-        return owner_starobj;
+    fn strFn(_: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
+        return self_obj;
     }
 };
 
@@ -960,13 +979,11 @@ pub const StarFunc = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
-            .str = &str,
         },
     },
 
-    fn str(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
-        _ = vt;
-        _ = allocator;
+    pub fn strFn(_: Allocator, _: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
         return &func_str.obj;
     }
 
@@ -1040,14 +1057,17 @@ pub const StarNone = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
-            .str = &str,
         },
     },
 
-    fn str(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
-        _ = vt;
-        _ = allocator;
+    fn strFn(_: Allocator, _: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
         return &none_str.obj;
+    }
+
+    pub fn initAttributes(allocator: Allocator) !void {
+        if (none_obj.obj.attributes.count() > 0) return;
+        try none_obj.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &none_obj.obj, &strFn)).obj);
     }
 
     var none_obj = StarNone{};
@@ -1060,14 +1080,17 @@ pub const StarStopIteration = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
-            .str = &str,
         },
     },
 
-    fn str(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
-        _ = vt;
-        _ = allocator;
+    fn strFn(_: Allocator, _: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
         return &stop_str.obj;
+    }
+
+    pub fn initAttributes(allocator: Allocator) !void {
+        if (stop_obj.obj.attributes.count() > 0) return;
+        try stop_obj.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &stop_obj.obj, &strFn)).obj);
     }
 
     var stop_obj = StarStopIteration{};
@@ -1081,7 +1104,6 @@ pub const StarBool = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
-            .str = &strFn,
         },
     },
 
@@ -1095,11 +1117,16 @@ pub const StarBool = struct {
         if (value) return &true_obj.obj else return &false_obj.obj;
     }
 
-    fn strFn(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
-        _ = allocator;
-        const owner_starobj = vt.basePtr();
-        const self: *StarBool = @fieldParentPtr("obj", owner_starobj);
+    fn strFn(_: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
+        const self: *StarBool = @fieldParentPtr("obj", self_obj);
         if (self.value) return &true_str.obj else return &false_str.obj;
+    }
+
+    pub fn initAttributes(allocator: Allocator) !void {
+        if (true_obj.obj.attributes.count() > 0) return;
+        try true_obj.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &true_obj.obj, &strFn)).obj);
+        try false_obj.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &false_obj.obj, &strFn)).obj);
     }
 
     var true_obj = StarBool{ .value = true };
@@ -1113,7 +1140,6 @@ pub const StarList = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
-            .str = &strFn,
         },
     },
 
@@ -1124,6 +1150,7 @@ pub const StarList = struct {
         self.* = .{ .items = list };
         try self.obj.attributes.put(allocator, "append", &(try StarBoundMethod.init(allocator, &self.obj, &append)).obj);
         try self.obj.attributes.put(allocator, dunder.iter, &(try StarBoundMethod.init(allocator, &self.obj, &iter)).obj);
+        try self.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &self.obj, &strFn)).obj);
         return self;
     }
 
@@ -1135,17 +1162,17 @@ pub const StarList = struct {
         return self.items.items[@intCast(actual_idx)];
     }
 
-    fn strFn(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
-        const owner_starobj = vt.basePtr();
-        const self: *StarList = @fieldParentPtr("obj", owner_starobj);
+    fn strFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
+        const self: *StarList = @fieldParentPtr("obj", self_obj);
 
         var buf = std.ArrayList(u8).empty;
         try buf.append(allocator, '[');
 
         for (self.items.items, 0..) |item, i| {
             if (i > 0) try buf.appendSlice(allocator, ", ");
-            if (item.vtable.str) |str_fn| {
-                const str_obj = try str_fn(&item.vtable, allocator);
+            if (try item.getMethodDunder(.str)) |str_method| {
+                const str_obj = try str_method.call(allocator, &.{});
                 const str_val = try downCast(StarStr, str_obj);
                 try buf.appendSlice(allocator, str_val.str);
             } else {
@@ -1173,6 +1200,60 @@ pub const StarList = struct {
     }
 };
 
+pub const StarDict = struct {
+    entries: std.AutoArrayHashMapUnmanaged(*StarObj, *StarObj),
+    obj: StarObj = .{
+        .vtable = StarObj.Vtable{
+            .name = @typeName(@This()),
+        },
+    },
+
+    pub fn init(allocator: Allocator, pairs: []const *StarObj) !*StarDict {
+        const self = try allocator.create(StarDict);
+        var entries = std.AutoArrayHashMapUnmanaged(*StarObj, *StarObj).empty;
+        var i: usize = 0;
+        while (i < pairs.len) : (i += 2) {
+            try entries.put(allocator, pairs[i], pairs[i + 1]);
+        }
+        self.* = .{ .entries = entries };
+        try self.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &self.obj, &strFn)).obj);
+        return self;
+    }
+
+    fn strFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
+        const self: *StarDict = @fieldParentPtr("obj", self_obj);
+
+        var buf = std.ArrayList(u8).empty;
+        try buf.append(allocator, '{');
+
+        var idx: usize = 0;
+        for (self.entries.keys(), self.entries.values()) |key, value| {
+            if (idx > 0) try buf.appendSlice(allocator, ", ");
+            if (try key.getMethodDunder(.str)) |str_method| {
+                const str_obj = try str_method.call(allocator, &.{});
+                const str_val = try downCast(StarStr, str_obj);
+                try buf.appendSlice(allocator, str_val.str);
+            } else {
+                try buf.appendSlice(allocator, "<object>");
+            }
+            try buf.appendSlice(allocator, ": ");
+            if (try value.getMethodDunder(.str)) |str_method| {
+                const str_obj = try str_method.call(allocator, &.{});
+                const str_val = try downCast(StarStr, str_obj);
+                try buf.appendSlice(allocator, str_val.str);
+            } else {
+                try buf.appendSlice(allocator, "<object>");
+            }
+            idx += 1;
+        }
+
+        try buf.append(allocator, '}');
+        const new = try StarStr.init(allocator, buf.items);
+        return &new.obj;
+    }
+};
+
 pub const StarRangeIter = struct {
     current: i64,
     stop: i64,
@@ -1180,7 +1261,6 @@ pub const StarRangeIter = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
-            .str = &strFn,
         },
     },
 
@@ -1189,6 +1269,7 @@ pub const StarRangeIter = struct {
         self.* = .{ .current = start, .stop = stop, .step = step_val };
         try self.obj.attributes.put(allocator, dunder.iter, &(try StarBoundMethod.init(allocator, &self.obj, &iter)).obj);
         try self.obj.attributes.put(allocator, dunder.next, &(try StarBoundMethod.init(allocator, &self.obj, &nextFn)).obj);
+        try self.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &self.obj, &strFn)).obj);
         return self;
     }
 
@@ -1207,9 +1288,8 @@ pub const StarRangeIter = struct {
         return &val.obj;
     }
 
-    fn strFn(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
-        _ = vt;
-        _ = allocator;
+    fn strFn(_: Allocator, _: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
         return &range_iter_str.obj;
     }
 
@@ -1222,7 +1302,6 @@ pub const StarListIter = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
-            .str = &strFn,
         },
     },
 
@@ -1232,6 +1311,7 @@ pub const StarListIter = struct {
 
         try self.obj.attributes.put(allocator, dunder.iter, &(try StarBoundMethod.init(allocator, &self.obj, &iter)).obj);
         try self.obj.attributes.put(allocator, dunder.next, &(try StarBoundMethod.init(allocator, &self.obj, &nextFn)).obj);
+        try self.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &self.obj, &strFn)).obj);
         return self;
     }
 
@@ -1249,9 +1329,8 @@ pub const StarListIter = struct {
         return val;
     }
 
-    fn strFn(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
-        _ = vt;
-        _ = allocator;
+    fn strFn(_: Allocator, _: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
         return &list_iter_str.obj;
     }
 
@@ -1266,13 +1345,11 @@ pub const StarBoundMethod = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
-            .str = &strFn,
         },
     },
 
-    fn strFn(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
-        _ = vt;
-        _ = allocator;
+    fn strFn(_: Allocator, _: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
         return &bound_method_str.obj;
     }
 
@@ -1295,13 +1372,12 @@ pub const StarModule = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
-            .str = &str,
         },
     },
 
-    fn str(vt: *StarObj.Vtable, allocator: Allocator) Error!*StarObj {
-        const owner_starobj = vt.basePtr();
-        const self_module: *StarModule = @fieldParentPtr("obj", owner_starobj);
+    fn strFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
+        const self_module: *StarModule = @fieldParentPtr("obj", self_obj);
 
         const str_val = try std.fmt.allocPrint(allocator, "<module '{s}'>", .{self_module.name});
         const new = try StarStr.init(allocator, str_val);
@@ -1318,6 +1394,7 @@ pub const StarModule = struct {
             .name = name,
             .init_fn = init_fn,
         };
+        try self.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &self.obj, &strFn)).obj);
         return self;
     }
 
@@ -1343,8 +1420,6 @@ pub const StarObj = struct {
 
     pub const Vtable = struct {
         name: []const u8,
-        // optional str method for string representation
-        str: ?*const fn (*Vtable, allocator: Allocator) Error!*StarObj = null,
 
         pub fn basePtr(self: *Vtable) *StarObj {
             return @fieldParentPtr("vtable", self);

@@ -99,8 +99,8 @@ const Stdlib = Runtime.StarNativeModule(struct {
         for (args, 0..) |arg, i| {
             if (i > 0) try stdout.print(" ", .{});
 
-            if (arg.vtable.str) |str_fn| {
-                const str_obj = try str_fn(&arg.vtable, Gc.allocator());
+            if (try arg.getMethodDunder(.str)) |str_method| {
+                const str_obj = try str_method.call(Gc.allocator(), &.{});
                 const str_val = try Runtime.downCast(Runtime.StarStr, str_obj);
                 try stdout.print("{s}", .{str_val.str});
             } else {

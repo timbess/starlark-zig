@@ -303,6 +303,9 @@ pub fn parseExprWithoutOperators(self: *Parser) Error!?Node.Index {
             .l_bracket => {
                 break :blk try self.parseListLiteral();
             },
+            .l_brace => {
+                break :blk try self.parseDictLiteral();
+            },
             .keyword_if => {
                 break :blk try self.parseIfStatement();
             },
@@ -473,6 +476,51 @@ fn parseListLiteral(self: *Parser) Error!Node.Index {
     });
 }
 
+fn parseDictLiteral(self: *Parser) Error!Node.Index {
+    const old_len = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(old_len);
+
+    const lbrace = try self.expectConsume(.l_brace);
+
+    while (true) {
+        if (self.currentTag() == .r_brace) {
+            break;
+        }
+
+        const key = try self.expectExpr();
+        try self.scratch.append(self.gpa, key);
+        _ = try self.expectConsume(.colon);
+        const value = try self.expectExpr();
+        try self.scratch.append(self.gpa, value);
+
+        if (self.consume(.comma)) |_| {
+            continue;
+        } else if (self.currentTag() == .r_brace) {
+            break;
+        } else {
+            return self.fail(.expected_expr);
+        }
+    }
+
+    _ = try self.expectConsume(.r_brace);
+
+    const interleaved = self.scratch.items[old_len..];
+    const count = interleaved.len / 2;
+    const arena = self.arena.allocator();
+    const keys_then_values = try arena.alloc(Node.Index, interleaved.len);
+    for (0..count) |i| {
+        keys_then_values[i] = interleaved[i * 2];
+        keys_then_values[i + count] = interleaved[i * 2 + 1];
+    }
+    return try self.addNode(.{
+        .main_token = lbrace,
+        .data = .{ .dict_literal = .{
+            .keys = keys_then_values[0..count],
+            .values = keys_then_values[count..],
+        } },
+    });
+}
+
 fn parseIfStatement(self: *Parser) Error!Node.Index {
     const if_tok = self.consume(.keyword_if) orelse self.consume(.keyword_elif) orelse return self.fail(.expected_expr);
     const condition = try self.expectExpr();
@@ -569,7 +617,7 @@ test Parser {
             \\foo = 2.0
             \\def my_fn(a):
             \\    b = 1
-            \\    return b
+            \\    return {"b": b}
         ;
 
         var tokenizer = Tokenizer.init(code);
@@ -596,6 +644,10 @@ test Parser {
         try std.testing.expectEqual(.fn_args, std.meta.activeTag(fn_args_definition.data));
         const fn_body_definition: Node = parser.nodes.get(8);
         try std.testing.expectEqual(.block, std.meta.activeTag(fn_body_definition.data));
+        const return_node: Node = parser.nodes.get(@intFromEnum(fn_body_definition.data.block.statements[1]));
+        try std.testing.expectEqual(.@"return", std.meta.activeTag(return_node.data));
+        const dict: Node = parser.nodes.get(@intFromEnum(return_node.data.@"return"));
+        try std.testing.expectEqual(.dict_literal, std.meta.activeTag(dict.data));
 
         // asdf lit token
         const asdf_lit_token = parser.tokens.get(@intFromEnum(asdf_lit.main_token));
@@ -641,6 +693,15 @@ test Parser {
         // Fn body
         const fn_body_statements = fn_body_definition.data.block.statements;
         try std.testing.expectEqual(2, fn_body_statements.len);
+
+        // literal dict in return values
+        const dict_keys = dict.data.dict_literal.keys;
+        const dict_values = dict.data.dict_literal.values;
+        try std.testing.expectEqual(dict_keys.len, dict_values.len);
+
+        const key = parser.nodes.get(@intFromEnum(dict_keys[0]));
+        const key_token = parser.tokens.get(@intFromEnum(key.main_token));
+        try std.testing.expectEqualStrings("\"b\"", try tokenizer.read_raw_token(key_token));
     }
     {}
 }

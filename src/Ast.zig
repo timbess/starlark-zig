@@ -84,6 +84,7 @@ pub const Node = struct {
         ge,
         get_attribute,
         list_literal,
+        dict_literal,
         index,
         @"if",
         @"for",
@@ -138,6 +139,10 @@ pub const Node = struct {
         },
         list_literal: struct {
             elements: []const Node.Index,
+        },
+        dict_literal: struct {
+            keys: []const Node.Index,
+            values: []const Node.Index,
         },
         index: struct {
             obj: Node.Index,

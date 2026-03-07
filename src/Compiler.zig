@@ -376,6 +376,7 @@ fn compileExpr(
             emit_getattr,
             emit_bool_not,
             emit_build_list,
+            emit_build_dict,
             emit_get_index,
         },
         node_idx: Ast.Node.Index,
@@ -462,6 +463,15 @@ fn compileExpr(
                             try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = ll.elements[i] });
                         }
                     },
+                    .dict_literal => |dl| {
+                        try work_stack.appendBounded(.{ .kind = .emit_build_dict, .node_idx = work.node_idx, .extra = @intCast(dl.keys.len) });
+                        var i: usize = dl.keys.len;
+                        while (i > 0) {
+                            i -= 1;
+                            try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = dl.values[i] });
+                            try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = dl.keys[i] });
+                        }
+                    },
                     .index => |idx| {
                         try work_stack.appendBounded(.{ .kind = .emit_get_index, .node_idx = work.node_idx });
                         try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = idx.idx });
@@ -493,6 +503,9 @@ fn compileExpr(
             },
             .emit_build_list => {
                 try builder.emit(.{ .build_list = work.extra });
+            },
+            .emit_build_dict => {
+                try builder.emit(.{ .build_dict = work.extra });
             },
             .emit_get_index => {
                 try builder.emit(.get_index);
@@ -698,7 +711,7 @@ fn compileBlock(
                     return error.AstInvalid;
                 }
             },
-            .call, .add, .sub, .mul, .eq, .ne, .lt, .le, .gt, .ge, .literal, .identifier, .list_literal, .index, .bool_not, .get_attribute => {
+            .call, .add, .sub, .mul, .eq, .ne, .lt, .le, .gt, .ge, .literal, .identifier, .list_literal, .dict_literal, .index, .bool_not, .get_attribute => {
                 try compileExpr(ast, source, builder, scope, stmt_idx, func_compiler, module_compiler);
                 try builder.emit(.pop);
             },
@@ -790,7 +803,7 @@ fn compileFunction(
                 const from: i32 = @intCast(func_compiler.base.currentOffset() + 1);
                 try func_compiler.base.emit(.{ .jump = target - from });
             },
-            .call, .add, .sub, .mul, .eq, .ne, .lt, .le, .gt, .ge, .literal, .identifier, .list_literal, .index, .bool_not => {
+            .call, .add, .sub, .mul, .eq, .ne, .lt, .le, .gt, .ge, .literal, .identifier, .list_literal, .dict_literal, .index, .bool_not => {
                 try compileExpr(ast, source, &func_compiler.base, &func_compiler.scope, stmt_idx, &func_compiler, null);
                 try func_compiler.base.emit(.pop);
             },
@@ -820,6 +833,7 @@ fn compileFunction(
         .name = func_name,
         .source_locs = try func_compiler.base.source_locs.toOwnedSlice(gc),
     };
+    try func.obj.attributes.put(gc, Runtime.dunder.str, &(try Runtime.StarBoundMethod.init(gc, &func.obj, &Runtime.StarFunc.strFn)).obj);
 
     return func;
 }
@@ -881,7 +895,7 @@ fn compileModule(
             .@"for" => |for_data| {
                 try compileFor(gc, arena, ast, source, interner, null, &module_compiler, for_data, stmt_node.main_token);
             },
-            .call, .add, .sub, .mul, .eq, .ne, .lt, .le, .gt, .ge, .literal, .identifier, .list_literal, .index, .bool_not, .get_attribute => {
+            .call, .add, .sub, .mul, .eq, .ne, .lt, .le, .gt, .ge, .literal, .identifier, .list_literal, .dict_literal, .index, .bool_not, .get_attribute => {
                 try compileExpr(ast, source, &module_compiler.base, &module_compiler.scope, stmt_idx, null, &module_compiler);
                 try module_compiler.base.emit(.pop);
             },
