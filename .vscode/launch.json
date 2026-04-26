@@ -8,8 +8,10 @@
       "name": "Launch Test",
       "type": "lldb",
       "request": "launch",
-      "program": "${workspaceRoot}/zig-out/bin/test",
+      "program": "${workspaceRoot}/zig-out/bin/test_starlark",
       "args": [],
+      "preLaunchTask": "build-test",
+      "console": "internalConsole",
       "cwd": "${workspaceRoot}"
     }
   ]

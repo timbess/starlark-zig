@@ -13,11 +13,6 @@ pub fn build(b: *std.Build) void {
     const libgc = compileLibgc(b, optimize, target) catch @panic("oom");
     exe_mod.addImport("zig_libgc", libgc);
 
-    const modules = [_]*std.Build.Module{
-        exe_mod,
-        libgc,
-    };
-
     const exe = b.addExecutable(.{
         .name = "starlark",
         .root_module = exe_mod,
@@ -48,13 +43,22 @@ pub fn build(b: *std.Build) void {
 
     const tests = b.step("test", "Run tests");
     const build_tests = b.step("build-test", "Build tests as binary");
-    for (modules) |mod| {
+    var modules_iter = b.modules.iterator();
+    while (modules_iter.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const mod = entry.value_ptr.*;
         const exe_tests = b.addTest(.{
             .root_module = mod,
         });
 
+        const exe_tests_llvm = b.addTest(.{
+            .name = b.fmt("test_{s}", .{name}),
+            .root_module = mod,
+            .use_llvm = true, // Needed for better DWARF debugging info (I think?)
+        });
+
         // Build tests without running for debugging.
-        const install_exe_tests = b.addInstallArtifact(exe_tests, .{});
+        const install_exe_tests = b.addInstallArtifact(exe_tests_llvm, .{});
         build_tests.dependOn(&install_exe_tests.step);
 
         // Build & Run tests.
@@ -99,8 +103,8 @@ fn compileLibgc(b: *std.Build, optimize: std.builtin.OptimizeMode, target: std.B
     });
     cmake_build.addDirectoryArg(build_output);
     // Ninja logs and breaks ZLS :(
-    _ = cmake_build.captureStdErr();
-    _ = cmake_build.captureStdOut();
+    _ = cmake_build.captureStdErr(.{});
+    _ = cmake_build.captureStdOut(.{});
 
     const cmake_install = b.addSystemCommand(&.{
         "cmake",
@@ -114,7 +118,7 @@ fn compileLibgc(b: *std.Build, optimize: std.builtin.OptimizeMode, target: std.B
 
     cmake_install.step.dependOn(&cmake_build.step);
 
-    const libgc_mod = b.createModule(.{
+    const libgc_mod = b.addModule("zig_libgc", .{
         .root_source_file = b.path("src/zig_libgc.zig"),
         .target = target,
         .optimize = optimize,

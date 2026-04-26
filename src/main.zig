@@ -15,39 +15,31 @@ pub const std_options: std.Options = .{
     },
 };
 
-pub fn main() !void {
-    var gpa: std.mem.Allocator = std.heap.smp_allocator;
-
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    if (builtin.mode == .Debug) {
-        gpa = debug_allocator.allocator();
-    }
-
-    defer if (builtin.mode == .Debug) {
-        _ = debug_allocator.deinit();
-    };
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
     var stdout = &stdout_writer.interface;
     defer stdout.flush() catch @panic("Failed to flush");
 
-    const args = try std.process.argsAlloc(gpa);
-    defer std.process.argsFree(gpa, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     var code_buf: [4096]u8 = undefined;
-    var file: ?std.fs.File = null;
-    defer if (file) |f| f.close();
+    var file: ?std.Io.File = null;
+    defer if (file) |f| f.close(io);
 
+    var file_reader: ?std.Io.File.Reader = null;
     var code_reader: *std.Io.Reader = blk: {
         if (args.len > 1 and !std.mem.eql(u8, args[1], "-")) {
-            const f = try std.fs.cwd().openFile(args[1], .{ .mode = .read_only });
+            const f = try std.Io.Dir.cwd().openFile(io, args[1], .{ .mode = .read_only });
             file = f;
-            var file_reader = f.reader(&code_buf);
-            break :blk &file_reader.interface;
+            file_reader = f.reader(io, &code_buf);
+            break :blk &file_reader.?.interface;
         } else {
-            var stdin_reader = std.fs.File.stdin().reader(&code_buf);
-            break :blk &stdin_reader.interface;
+            file_reader = std.Io.File.stdin().reader(io, &code_buf);
+            break :blk &file_reader.?.interface;
         }
     };
 
@@ -63,7 +55,11 @@ pub fn main() !void {
 
     const gc = Gc.allocator();
     const module = try Compiler.compile(gpa, if (file) |_| args[1] else "<stdin>", code, &ast, .{}, gc);
-    var runtime = try Runtime.init(gpa, .{ .gc = gc });
+    var frame_alloc = std.heap.stackFallback(@sizeOf(Runtime.Frame) * 4096, gc);
+    var runtime = try Runtime.init(gpa, .{
+        .gc = gc,
+        .frame_alloc = frame_alloc.get(),
+    });
     defer runtime.deinit();
 
     try runtime.registerStdlib(Stdlib);
@@ -74,7 +70,7 @@ pub fn main() !void {
 
     runtime.execModule(&module) catch {
         var stderr_buf: [4096]u8 = undefined;
-        var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+        var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buf);
         var stderr = &stderr_writer.interface;
 
         diag.format(stderr) catch {};
@@ -91,8 +87,9 @@ const Stdlib = Runtime.StarNativeModule(struct {
     }
 
     pub fn print(_: *Runtime, args: []const *Runtime.StarObj) Runtime.Error!?*Runtime.StarObj {
+        const io = std.Io.Threaded.global_single_threaded.io();
         var stdout_buf: [4096]u8 = undefined;
-        var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+        var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
         var stdout = &stdout_writer.interface;
         defer stdout.flush() catch @panic("Failed to flush");
 
@@ -119,21 +116,21 @@ const Stdlib = Runtime.StarNativeModule(struct {
         switch (args.len) {
             1 => {
                 const stop_int = try Runtime.downCast(Runtime.StarInt, args[0]);
-                stop = @intCast(stop_int.num);
+                stop = stop_int.num;
             },
             2 => {
                 const start_int = try Runtime.downCast(Runtime.StarInt, args[0]);
                 const stop_int = try Runtime.downCast(Runtime.StarInt, args[1]);
-                start = @intCast(start_int.num);
-                stop = @intCast(stop_int.num);
+                start = start_int.num;
+                stop = stop_int.num;
             },
             3 => {
                 const start_int = try Runtime.downCast(Runtime.StarInt, args[0]);
                 const stop_int = try Runtime.downCast(Runtime.StarInt, args[1]);
                 const step_int = try Runtime.downCast(Runtime.StarInt, args[2]);
-                start = @intCast(start_int.num);
-                stop = @intCast(stop_int.num);
-                step_val = @intCast(step_int.num);
+                start = start_int.num;
+                stop = stop_int.num;
+                step_val = step_int.num;
             },
             else => return Runtime.RuntimeError.ArityMismatch,
         }
@@ -146,10 +143,10 @@ const Stdlib = Runtime.StarNativeModule(struct {
         if (args.len != 1) return Runtime.RuntimeError.ArityMismatch;
 
         if (Runtime.downCast(Runtime.StarList, args[0])) |list| {
-            const result = try Runtime.StarInt.init(rt.gc, list.items.items.len);
+            const result = try Runtime.StarInt.init(rt.gc, @intCast(list.items.items.len));
             return &result.obj;
         } else |_| if (Runtime.downCast(Runtime.StarStr, args[0])) |str| {
-            const result = try Runtime.StarInt.init(rt.gc, str.str.len);
+            const result = try Runtime.StarInt.init(rt.gc, @intCast(str.str.len));
             return &result.obj;
         } else |_| {
             return Runtime.TypeError.TypeMismatch;

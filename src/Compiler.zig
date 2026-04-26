@@ -334,7 +334,7 @@ inline fn compileLiteral(
             const number_src = source[token.loc.start..token.loc.end];
             const number_res = std.zig.parseNumberLiteral(number_src);
             return switch (number_res) {
-                .int => |n| &(try Runtime.StarInt.init(builder.gc, n)).obj,
+                .int => |n| &(try Runtime.StarInt.init(builder.gc, @intCast(n))).obj,
                 .big_int => error.BigIntUnsupported,
                 .failure => error.LiteralInvalid,
                 .float => {

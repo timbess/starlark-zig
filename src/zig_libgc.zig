@@ -165,10 +165,9 @@ test "GcAllocator Finalizer" {
             const a = allocator();
             const node: *Node = try a.create(Node);
             registerFinalizer(node, self.finalizer, &Finalizer.finalize);
+            collect(); // Should do nothing since node is reachable
         }
     }{ .finalizer = &finalizer }).new_stack_frame();
-
-    collect();
 
     {
         const c = invokeFinalizers();
@@ -176,7 +175,7 @@ test "GcAllocator Finalizer" {
     }
 
     try std.testing.expect(!finalizer.called);
-    collect();
+    collect(); // Now it must be collected
 
     {
         const c = invokeFinalizers();

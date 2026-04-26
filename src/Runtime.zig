@@ -4,14 +4,16 @@ const Tokenizer = @import("Tokenizer.zig");
 const Compiler = @import("Compiler.zig");
 const Token = Tokenizer.Token;
 const Ast = @import("Ast.zig");
+const util = @import("util.zig");
 
 const scope = .runtime;
 const log = std.log.scoped(scope);
 
 gpa: Allocator,
 gc: Allocator,
+frame_alloc: Allocator = undefined,
 /// Call stack for code/locals
-frames: std.SegmentedList(Frame, 4096) = .{},
+frames: std.ArrayList(Frame) = .empty,
 /// Value stack
 stack: std.ArrayList(*StarObj) = .empty,
 /// Globals
@@ -24,7 +26,8 @@ current_filename: ?[]const u8 = null,
 diagnostic: ?*Diagnostic = null,
 
 const knobs = struct {
-    const locals_initial_capacity: usize = 16;
+    const locals_capacity: usize = 64;
+    const frames_capacity: usize = 4096;
 };
 
 pub const dunder = struct {
@@ -43,7 +46,11 @@ pub const dunder = struct {
 };
 
 pub const InitOpts = struct {
+    /// This allocator is treated as if `free` calls are not required. In production it will be a GC,
+    /// but in tests or other uses, it could be an arena.
     gc: Allocator,
+    /// Allows for optimizing frame allocation with either a fixed-size bump allocator or whatever the user pleases.
+    frame_alloc: ?Allocator = null,
 };
 
 pub const GlobalIdx = enum(u32) { _ };
@@ -111,6 +118,8 @@ pub const RuntimeError = error{
     CallUndefined,
     FrameMissing,
     FrameNoReturn,
+    /// For now there is a static number of locals stored in a frame.
+    FrameOversized,
     ReturnedOutsideFunction,
     AttributeMissing,
     GlobalUndefined,
@@ -155,7 +164,7 @@ pub const Diagnostic = struct {
     fn offsetToLineCol(source: [:0]const u8, offset: u32) struct { line: u32, col: u32 } {
         var line: u32 = 1;
         var col: u32 = 1;
-        for (source[0..@min(offset, @as(u32, @intCast(source.len)))]) |c| {
+        for (source[0..@min(offset, source.len)]) |c| {
             if (c == '\n') {
                 line += 1;
                 col = 1;
@@ -167,7 +176,7 @@ pub const Diagnostic = struct {
     }
 
     fn getSourceLine(source: [:0]const u8, offset: u32) []const u8 {
-        const clamped = @min(offset, @as(u32, @intCast(source.len)));
+        const clamped = @min(offset, source.len);
         var start: usize = clamped;
         while (start > 0 and source[start - 1] != '\n') start -= 1;
         var end: usize = clamped;
@@ -176,7 +185,7 @@ pub const Diagnostic = struct {
     }
 
     fn getLineStartOffset(source: [:0]const u8, offset: u32) u32 {
-        var pos: u32 = @min(offset, @as(u32, @intCast(source.len)));
+        var pos: u32 = @min(offset, source.len);
         while (pos > 0 and source[pos - 1] != '\n') pos -= 1;
         return pos;
     }
@@ -184,11 +193,21 @@ pub const Diagnostic = struct {
     fn getErrorCategory(err: Error) []const u8 {
         return switch (err) {
             error.TypeMismatch => "TypeError",
-            error.AddOpUndefined, error.SubOpUndefined, error.MulOpUndefined,
-            error.ArityMismatch, error.LocalOutOfRange, error.LocalUninitialized,
-            error.ConstOutOfRange, error.StackUnderflow, error.CallUndefined,
-            error.FrameMissing, error.FrameNoReturn, error.ReturnedOutsideFunction,
-            error.AttributeMissing, error.GlobalUndefined, error.FreeVarOutOfRange,
+            error.AddOpUndefined,
+            error.SubOpUndefined,
+            error.MulOpUndefined,
+            error.ArityMismatch,
+            error.LocalOutOfRange,
+            error.LocalUninitialized,
+            error.ConstOutOfRange,
+            error.StackUnderflow,
+            error.CallUndefined,
+            error.FrameMissing,
+            error.FrameNoReturn,
+            error.ReturnedOutsideFunction,
+            error.AttributeMissing,
+            error.GlobalUndefined,
+            error.FreeVarOutOfRange,
             => "RuntimeError",
             error.OutOfMemory => "MemoryError",
             else => "Error",
@@ -212,7 +231,7 @@ pub const Diagnostic = struct {
                 );
 
                 const line_content = getSourceLine(source, entry.source_loc.byte_offset);
-                const leading_ws = line_content.len - std.mem.trimLeft(u8, line_content, " \t").len;
+                const leading_ws = line_content.len - std.mem.trimStart(u8, line_content, " \t").len;
                 try writer.print("    {s}\n", .{line_content[leading_ws..]});
 
                 if (is_innermost and entry.source_loc.len > 0) {
@@ -248,11 +267,33 @@ pub const Diagnostic = struct {
     }
 };
 
-const Frame = struct {
+/// A single frame in the call stack, containing the function being executed and its local variables.
+pub const Frame = struct {
     func: *StarFunc,
-    locals: std.SegmentedList(*StarObj, knobs.locals_initial_capacity),
+    locals: util.BoundedArray(knobs.locals_capacity, *StarObj),
     sp_base: usize,
     pc: usize, // pc inside this frame's code
+
+    pub fn init(self: *Frame, func: *StarFunc, sp_base: usize, args: []*StarObj) !void {
+        self.* = .{
+            .func = func,
+            .locals = .init(),
+            .sp_base = sp_base,
+            .pc = 0,
+        };
+
+        if (func.frame_size > 0) {
+            if (func.frame_size > self.locals.items.len) return Error.FrameOversized;
+            try self.locals.appendSlice(args);
+            for (args.len..func.frame_size) |_| {
+                try self.locals.append(StarNone.instance);
+            }
+        }
+    }
+
+    pub fn deinit(self: *Frame) void {
+        _ = self;
+    }
 
     pub fn readConst(self: *Frame, idx: ConstIdx) Error!*StarObj {
         const const_idx = @intFromEnum(idx);
@@ -263,13 +304,13 @@ const Frame = struct {
     pub fn writeLocal(self: *Frame, idx: LocalIdx, value: *StarObj) Error!void {
         const local_idx = @intFromEnum(idx);
         if (local_idx >= self.locals.len) return RuntimeError.LocalOutOfRange;
-        self.locals.at(local_idx).* = value;
+        self.locals.items[local_idx] = value;
     }
 
     pub fn readLocal(self: *Frame, idx: LocalIdx) Error!*StarObj {
         const local_idx = @intFromEnum(idx);
         if (local_idx >= self.locals.len) return RuntimeError.LocalOutOfRange;
-        const local = self.locals.at(local_idx).*;
+        const local = self.locals.items[local_idx];
         return local;
     }
 
@@ -289,19 +330,20 @@ pub fn init(gpa: Allocator, opts: InitOpts) !Runtime {
     try StarNone.initAttributes(opts.gc);
     try StarBool.initAttributes(opts.gc);
     try StarStopIteration.initAttributes(opts.gc);
+
     return Runtime{
         .gpa = gpa,
         .gc = opts.gc,
+        .frame_alloc = opts.frame_alloc orelse opts.gc,
     };
 }
 
 pub fn deinit(self: *Runtime) void {
     // free any frame locals still allocated
-    var frame_iter = self.frames.iterator(0);
-    while (frame_iter.next()) |frame| {
-        frame.locals.deinit(self.gc);
+    for (self.frames.items) |*frame| {
+        frame.deinit();
     }
-    self.frames.deinit(self.gc);
+    self.frames.deinit(self.frame_alloc);
     self.stack.deinit(self.gc);
     self.globals.deinit(self.gc);
 }
@@ -324,20 +366,10 @@ fn callFn(self: *Runtime, func: *StarFunc, args: []*StarObj) Error!void {
     const sp_base = self.stack.items.len;
     log.debug("sp_base: {d}", .{sp_base});
 
-    var frame = Frame{
-        .func = func,
-        .locals = .{},
-        .sp_base = sp_base,
-        .pc = 0,
-    };
-    if (func.frame_size > 0) {
-        try frame.locals.growCapacity(self.gc, func.frame_size);
-        try frame.locals.appendSlice(self.gc, args);
-        for (args.len..func.frame_size) |_| {
-            try frame.locals.append(self.gc, StarNone.instance);
-        }
-    }
-    try self.frames.append(self.gc, frame);
+    var frame: Frame = undefined;
+    try frame.init(func, sp_base, args);
+
+    try self.frames.append(self.frame_alloc, frame);
 }
 
 fn stackPop(self: *Runtime) Error!*StarObj {
@@ -353,13 +385,13 @@ fn stackPushOne(self: *Runtime) Error!**StarObj {
 }
 
 fn storeGlobal(self: *Runtime, name_idx: GlobalIdx, value: *StarObj) Error!void {
-    const frame: *Frame = self.frames.at(self.frames.len - 1);
+    const frame: *Frame = &self.frames.items[self.frames.items.len - 1];
     const name = frame.func.names_global[@intFromEnum(name_idx)];
     try self.globals.put(self.gc, name, value);
 }
 
 fn loadGlobal(self: *Runtime, name_idx: GlobalIdx) Error!*StarObj {
-    const frame: *Frame = self.frames.at(self.frames.len - 1);
+    const frame: *Frame = &self.frames.items[self.frames.items.len - 1];
     const name = frame.func.names_global[@intFromEnum(name_idx)];
     log.debug("Loading global: {s}", .{name});
     return self.globals.get(name) orelse return RuntimeError.GlobalUndefined;
@@ -376,15 +408,15 @@ fn fillDiagnostic(self: *Runtime, err: Error) void {
         diag.filename = cf;
     }
 
-    if (self.frames.len == 0) {
+    if (self.frames.items.len == 0) {
         diag.trace = &.{};
         return;
     }
 
     var entries = std.ArrayList(StackTraceEntry).empty;
     var i: usize = 0;
-    while (i < self.frames.len) : (i += 1) {
-        const frame: *Frame = self.frames.at(i);
+    while (i < self.frames.items.len) : (i += 1) {
+        const frame: *Frame = &self.frames.items[i];
         const func = frame.func;
         const pc = if (frame.pc > 0) frame.pc else 0;
         const source_loc = if (pc < func.source_locs.len) func.source_locs[pc] else SourceLoc.none;
@@ -400,7 +432,7 @@ fn fillDiagnostic(self: *Runtime, err: Error) void {
 
 /// Step until frame stack is empty, filling in diagnostics in case of error.
 pub fn stepUntilDone(self: *Runtime) Error!void {
-    while (self.frames.len > 0) {
+    while (self.frames.items.len > 0) {
         self.step() catch |err| {
             self.fillDiagnostic(err);
             return err;
@@ -410,8 +442,8 @@ pub fn stepUntilDone(self: *Runtime) Error!void {
 
 // Move interpreter forward one step. DOES NOT populate error diagnostics.
 fn step(self: *Runtime) Error!void {
-    if (self.frames.len == 0) return RuntimeError.FrameMissing;
-    var frame: *Frame = self.frames.at(self.frames.len - 1);
+    if (self.frames.items.len == 0) return RuntimeError.FrameMissing;
+    var frame: *Frame = &self.frames.items[self.frames.items.len - 1];
     const active_code = frame.func.code;
 
     if (frame.pc >= active_code.len) return RuntimeError.FrameNoReturn;
@@ -450,7 +482,9 @@ fn step(self: *Runtime) Error!void {
             const lhs = try self.stackPop();
 
             // Sorta nice that it enforces that the dunder struct must match the op name.
-            const dunder_op = switch (op) {inline else => |o| @field(std.meta.DeclEnum(dunder), @tagName(o))};
+            const dunder_op = switch (op) {
+                inline else => |o| @field(std.meta.DeclEnum(dunder), @tagName(o)),
+            };
 
             const bound_method = try lhs.getMethodDunder(dunder_op) orelse return Error.AddOpUndefined;
             const result = try bound_method.call(self.gc, &.{rhs});
@@ -479,7 +513,6 @@ fn step(self: *Runtime) Error!void {
             // Try interpreted function first: downCast StarFunc
             const maybe_func: ?*StarFunc = downCast(StarFunc, func_obj) catch |e| switch (e) {
                 TypeError.TypeMismatch => null,
-                else => return e,
             };
 
             if (maybe_func) |fptr| {
@@ -638,8 +671,7 @@ fn step(self: *Runtime) Error!void {
             _ = try self.stackPop();
         },
         .ret, .ret_none => {
-            var frame_val = self.frames.pop() orelse return error.ReturnedOutsideFunction;
-            frame_val.locals.deinit(self.gpa);
+            const frame_val = self.frames.pop() orelse return error.ReturnedOutsideFunction;
             const return_value =
                 if (std.meta.activeTag(instr) == .ret) try self.stackPop() else StarNone.instance;
             log.debug("ret: returning {s}", .{return_value.vtable.name});
@@ -662,7 +694,7 @@ fn scopedLookup(self: *Runtime, idx: FreeVarIdx) Error!?*StarObj {
     const current = self.frames.items[self.frames.items.len - 1];
     const func = current.func;
     const name = func.names[free_idx];
-    var i = self.frames.len;
+    var i = self.frames.items.len;
     while (i > 0) : (i -= 1) {
         const frame = self.frames.items[i - 1];
 
@@ -699,14 +731,14 @@ pub fn execModule(self: *Runtime, module: *const Compiler.Module) Error!void {
 }
 
 pub const StarInt = struct {
-    num: u64,
+    num: i64,
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
         },
     },
 
-    pub fn init(allocator: Allocator, num: u64) !*StarInt {
+    pub fn init(allocator: Allocator, num: i64) !*StarInt {
         const self = try allocator.create(StarInt);
         self.* = .{ .num = num };
         try self.obj.attributes.put(allocator, dunder.add, &(try StarBoundMethod.init(allocator, &self.obj, &add)).obj);
@@ -919,7 +951,7 @@ pub fn downCast(T: type, obj: *StarObj) TypeError!*T {
 
 pub fn starTypeToZig(T: type) type {
     switch (T) {
-        StarInt => return u64,
+        StarInt => return i64,
         StarFloat => return f64,
         StarStr => return []const u8,
         else => @compileError("Unsupported type " ++ @typeName(T)),
@@ -1041,8 +1073,8 @@ pub const StarFunc = struct {
 
     test "Native function" {
         const Args = struct {
-            x: u64,
-            y: u64,
+            x: i64,
+            y: i64,
         };
         _ = fromNative(Args, struct {
             pub fn inner(_: *Runtime, args: Args) Error!?*StarObj {
@@ -1766,11 +1798,11 @@ test "Nested functions and closures" {
 
     const captured_obj = f_func.closure_cells[0];
     const captured_val = try Runtime.downCast(Runtime.StarInt, captured_obj);
-    try std.testing.expectEqual(@as(u64, 42), captured_val.num);
+    try std.testing.expectEqual(@as(i64, 42), captured_val.num);
 
     const result_val = rt.globals.get("result") orelse return error.TestUnexpectedResult;
     const result_int = try Runtime.downCast(Runtime.StarInt, result_val);
-    try std.testing.expectEqual(@as(u64, 42), result_int.num);
+    try std.testing.expectEqual(@as(i64, 42), result_int.num);
 
     try std.testing.expectEqual(0, rt.stack.items.len);
 }
@@ -1787,7 +1819,7 @@ test "registerStdlib populates runtime globals" {
             return null;
         }
 
-        pub fn square(_: *Runtime, args: struct { n: u64 }) Error!?*StarObj {
+        pub fn square(_: *Runtime, args: struct { n: i64 }) Error!?*StarObj {
             _ = args.n * args.n;
             return null;
         }
