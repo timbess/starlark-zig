@@ -62,14 +62,45 @@ pub const Stdlib = Runtime.StarNativeModule(struct {
         return &iter.obj;
     }
 
+    pub fn @"type"(rt: *Runtime, args: []const *Runtime.StarObj) Runtime.Error!?*Runtime.StarObj {
+        if (args.len != 1) return Runtime.RuntimeError.ArityMismatch;
+        const result = try Runtime.StarStr.init(rt.gc, args[0].vtable.type_name);
+        return &result.obj;
+    }
+
+    pub fn float(rt: *Runtime, args: []const *Runtime.StarObj) Runtime.Error!?*Runtime.StarObj {
+        if (args.len != 1) return Runtime.RuntimeError.ArityMismatch;
+        if (Runtime.downCast(Runtime.StarFloat, args[0])) |_| {
+            return args[0];
+        } else |_| {}
+        if (Runtime.downCast(Runtime.StarInt, args[0])) |i| {
+            const result = try Runtime.StarFloat.init(rt.gc, @floatFromInt(i.num));
+            return &result.obj;
+        } else |_| {}
+        if (Runtime.downCast(Runtime.StarStr, args[0])) |s| {
+            const n = std.fmt.parseFloat(f64, s.str) catch return Runtime.RuntimeError.TypeMismatch;
+            const result = try Runtime.StarFloat.init(rt.gc, n);
+            return &result.obj;
+        } else |_| {}
+        return Runtime.RuntimeError.TypeMismatch;
+    }
+
+    pub fn str(rt: *Runtime, args: []const *Runtime.StarObj) Runtime.Error!?*Runtime.StarObj {
+        if (args.len != 1) return Runtime.RuntimeError.ArityMismatch;
+        if (try args[0].getMethodDunder(.str)) |str_method| {
+            return try str_method.call(rt.gc, &.{});
+        }
+        return Runtime.RuntimeError.TypeMismatch;
+    }
+
     pub fn len(rt: *Runtime, args: []const *Runtime.StarObj) Runtime.Error!?*Runtime.StarObj {
         if (args.len != 1) return Runtime.RuntimeError.ArityMismatch;
 
         if (Runtime.downCast(Runtime.StarList, args[0])) |list| {
             const result = try Runtime.StarInt.init(rt.gc, @intCast(list.items.items.len));
             return &result.obj;
-        } else |_| if (Runtime.downCast(Runtime.StarStr, args[0])) |str| {
-            const result = try Runtime.StarInt.init(rt.gc, @intCast(str.str.len));
+        } else |_| if (Runtime.downCast(Runtime.StarStr, args[0])) |s| {
+            const result = try Runtime.StarInt.init(rt.gc, @intCast(s.str.len));
             return &result.obj;
         } else |_| {
             return Runtime.TypeError.TypeMismatch;

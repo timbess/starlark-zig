@@ -88,8 +88,18 @@ pub const Node = struct {
         index,
         @"if",
         @"for",
+        @"while",
+        if_expression,
+        tuple_literal,
+        mod,
+        div,
+        floor_div,
+        bit_or,
+        contains,
+        lambda,
         @"break",
         @"continue",
+        pass,
     };
 
     pub const Data = union(Tag) {
@@ -107,6 +117,7 @@ pub const Node = struct {
         },
         fn_arg: struct {
             binding: Token.Index,
+            default: Node.Index, // .none if no default
         },
         fn_args: struct {
             positional: []const Node.Index,
@@ -120,6 +131,7 @@ pub const Node = struct {
         },
         call_args: struct {
             args: []const Node.Index,
+            kwargs: []const KwArg = &.{},
         },
         bool_and: BinOp,
         bool_or: BinOp,
@@ -158,12 +170,35 @@ pub const Node = struct {
             iterable: Node.Index,
             body: Node.Index,
         },
+        @"while": struct {
+            condition: Node.Index,
+            body: Node.Index,
+        },
+        if_expression: struct {
+            condition: Node.Index,
+            then_branch: Node.Index,
+            else_branch: Node.Index,
+        },
+        tuple_literal: struct {
+            elements: []const Node.Index,
+        },
+        mod: BinOp,
+        div: BinOp,
+        floor_div: BinOp,
+        bit_or: BinOp,
+        contains: BinOp,
+        lambda: Lambda,
         @"break": void,
         @"continue": void,
+        pass: void,
     };
 };
 
 pub const BinOp = struct { lhs: Node.Index, rhs: Node.Index };
+
+pub const Lambda = struct { args: Node.Index, body: Node.Index };
+
+pub const KwArg = struct { name: Token.Index, value: Node.Index };
 
 pub const DebugNodeFormatter = std.fmt.Formatter(*const Ast, struct {
     pub fn format(

@@ -66,8 +66,7 @@ fn stripAndNullTerminate(allocator: std.mem.Allocator, chunk: []const u8) ![:0]c
         const line = chunk[pos..line_end];
         const trimmed = std.mem.trimStart(u8, line, " \t");
 
-        const skip = std.mem.startsWith(u8, trimmed, "load(") or
-            std.mem.startsWith(u8, trimmed, "# option:");
+        const skip = std.mem.startsWith(u8, trimmed, "# option:");
 
         if (!skip) {
             try buf.appendSlice(allocator, line);
@@ -126,8 +125,8 @@ fn runSpecFile(comptime name: []const u8, comptime source: []const u8) TestRepor
         const result = blk: {
             const null_term = stripAndNullTerminate(gc, chunk) catch break :blk false;
             if (std.mem.trim(u8, null_term, " \t\n\r").len == 0) {
-                skipped += 1;
-                break :blk true; // empty chunk counts as pass
+                // Genuinely empty chunk (just whitespace) — count as pass.
+                break :blk true;
             }
 
             var ast = Ast.parse(std.testing.allocator, null_term) catch break :blk false;
@@ -139,7 +138,10 @@ fn runSpecFile(comptime name: []const u8, comptime source: []const u8) TestRepor
 
             rt.registerStdlib(stdlib.Stdlib) catch break :blk false;
             test_predeclared.register(&rt, gc) catch break :blk false;
-            rt.execModule(&module) catch break :blk false;
+            rt.execModule(&module) catch {
+                test_predeclared.reset();
+                break :blk false;
+            };
 
             const err_count = test_predeclared.getErrorCount();
             test_predeclared.reset();

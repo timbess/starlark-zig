@@ -3,8 +3,15 @@ const Tokenizer = @This();
 
 source: [:0]const u8,
 index: usize = 0,
-indent_level: usize = 0,
-indent_size: usize = 0,
+indent_stack: [32]usize = undefined,
+indent_depth: usize = 0,
+paren_depth: usize = 0,
+/// When > 0, we're in the middle of emitting block_end tokens for a multi-
+/// level dedent. Each emission pops one level off `indent_stack` and
+/// decrements this counter.
+pending_dedents: usize = 0,
+/// The opening quote character of the string currently being tokenized.
+string_quote: u8 = 0,
 state: State = .start,
 
 const State = enum {
@@ -63,14 +70,27 @@ pub const Token = struct {
         keyword_in,
         keyword_break,
         keyword_continue,
+        keyword_none,
+        keyword_pass,
+        percent,
+        percent_eq,
         colon,
         star,
+        star_eq,
         starstar,
         minus,
         minus_eq,
         plus,
         plus_eq,
+        slash,
+        slash_eq,
+        slash_slash,
+        slash_slash_eq,
+        pipe,
+        pipe_eq,
         dot,
+        keyword_lambda,
+        keyword_while,
     };
 
     pub const Loc = struct {
@@ -93,6 +113,10 @@ pub const Token = struct {
         .{ "in", .keyword_in },
         .{ "break", .keyword_break },
         .{ "continue", .keyword_continue },
+        .{ "None", .keyword_none },
+        .{ "pass", .keyword_pass },
+        .{ "lambda", .keyword_lambda },
+        .{ "while", .keyword_while },
     });
 
     pub fn getKeyword(name: []const u8) ?Tag {
@@ -108,8 +132,24 @@ pub fn init(source: [:0]const u8) Tokenizer {
     };
 }
 
+/// Current open block's indent width, or 0 at module level.
+inline fn currentIndent(self: *const Tokenizer) usize {
+    return if (self.indent_depth == 0) 0 else self.indent_stack[self.indent_depth - 1];
+}
+
 // TODO: Does this need to be fallible if tokens can be invalid? Maybe invalid shouldn't be a tag.
 pub fn next(self: *Tokenizer) Error!Token {
+    // Emit any pending dedent block_end tokens before processing input. Each
+    // pending emit pops one level off the indent stack.
+    if (self.pending_dedents > 0) {
+        self.pending_dedents -= 1;
+        if (self.indent_depth > 0) self.indent_depth -= 1;
+        return .{
+            .tag = .block_end,
+            .loc = .{ .start = self.index, .end = self.index },
+        };
+    }
+
     var result: Token = .{ .tag = undefined, .loc = .{
         .start = self.index,
         .end = undefined,
@@ -120,8 +160,8 @@ pub fn next(self: *Tokenizer) Error!Token {
             switch (self.source[self.index]) {
                 // String is null terminated to make EOF handling nicer.
                 0 => {
-                    if (self.indent_size > 0 and self.indent_level > 0) {
-                        self.indent_level -= self.indent_size;
+                    if (self.indent_depth > 0) {
+                        self.indent_depth -= 1;
                         return .{
                             .tag = .block_end,
                             .loc = .{
@@ -144,8 +184,13 @@ pub fn next(self: *Tokenizer) Error!Token {
                     }
                 },
                 '\n', '\r' => {
-                    indent = 0;
                     self.index += 1;
+                    if (self.paren_depth > 0) {
+                        // Inside parens/brackets/braces: skip indentation processing
+                        result.loc.start = self.index;
+                        continue :state .start;
+                    }
+                    indent = 0;
                     continue :state .indentation;
                 },
                 // Should only handle mid-line WS.
@@ -188,18 +233,22 @@ pub fn next(self: *Tokenizer) Error!Token {
                 },
                 '[' => {
                     self.index += 1;
+                    self.paren_depth += 1;
                     result.tag = .l_bracket;
                 },
                 ']' => {
                     self.index += 1;
+                    if (self.paren_depth > 0) self.paren_depth -= 1;
                     result.tag = .r_bracket;
                 },
                 '{' => {
                     self.index += 1;
+                    self.paren_depth += 1;
                     result.tag = .l_brace;
                 },
                 '}' => {
                     self.index += 1;
+                    if (self.paren_depth > 0) self.paren_depth -= 1;
                     result.tag = .r_brace;
                 },
                 '*' => {
@@ -217,12 +266,27 @@ pub fn next(self: *Tokenizer) Error!Token {
                     result.tag = .minus;
                     continue :state .operator_two_char;
                 },
+                '/' => {
+                    self.index += 1;
+                    result.tag = .slash;
+                    continue :state .operator_two_char;
+                },
+                '|' => {
+                    self.index += 1;
+                    result.tag = .pipe;
+                    continue :state .operator_two_char;
+                },
                 '0'...'9' => {
                     continue :state .number;
                 },
                 'a'...'z', 'A'...'Z', '_' => {
                     self.index += 1;
                     continue :state .identifier;
+                },
+                '%' => {
+                    self.index += 1;
+                    result.tag = .percent;
+                    continue :state .operator_two_char;
                 },
                 '.' => {
                     self.index += 1;
@@ -232,15 +296,18 @@ pub fn next(self: *Tokenizer) Error!Token {
                     self.index += 1;
                     result.tag = .comma;
                 },
-                '"' => {
+                '"', '\'' => {
+                    self.string_quote = self.source[self.index];
                     continue :state .string;
                 },
                 '(' => {
                     self.index += 1;
+                    self.paren_depth += 1;
                     result.tag = .l_paren;
                 },
                 ')' => {
                     self.index += 1;
+                    if (self.paren_depth > 0) self.paren_depth -= 1;
                     result.tag = .r_paren;
                 },
                 ':' => {
@@ -253,35 +320,46 @@ pub fn next(self: *Tokenizer) Error!Token {
         // Consume prefixed indentation to start/end blocks.
         .indentation => {
             switch (self.source[self.index]) {
-                ' ', '\t' => {
+                ' ' => {
                     indent += 1;
                     self.index += 1;
                     continue :state .indentation;
                 },
+                // A tab advances to the next column that is a multiple of 8.
+                '\t' => {
+                    indent = (indent / 8 + 1) * 8;
+                    self.index += 1;
+                    continue :state .indentation;
+                },
                 else => {
-                    if (indent == self.indent_level) {
-                        // skip WS when next line is equal indent
+                    const cur = self.currentIndent();
+                    if (indent == cur) {
+                        // Same indent as current block — no token, just continue
+                        // tokenizing the line.
                         result.loc.start = self.index;
                         continue :state .start;
-                    } else if (indent < self.indent_level) {
-                        // Emit one block_end per indent level decrease
-                        result.loc.start = self.index;
-                        if (self.indent_size > 0) {
-                            self.indent_level -= self.indent_size;
-                        } else {
-                            self.indent_level = indent;
-                        }
-                        result.tag = .block_end;
-                    } else {
-                        self.indent_level = indent;
-                        // TODO: This is likely wrong, detecting indentation needs to be smarter.
-                        if (self.indent_size == 0) {
-                            self.indent_size = indent;
-                            // TODO: Is there a way to do this without a runtime known rhs?
-                        } else if (@mod(indent, self.indent_size) != 0) {
-                            continue :state .invalid;
-                        }
+                    } else if (indent > cur) {
+                        // Open a new block at this indent level.
+                        if (self.indent_depth >= self.indent_stack.len) continue :state .invalid;
+                        self.indent_stack[self.indent_depth] = indent;
+                        self.indent_depth += 1;
                         result.tag = .block_start;
+                    } else {
+                        // Close one or more blocks. Pop until the top matches
+                        // `indent`. The new indent must match an existing
+                        // open level exactly (Python/Starlark rule). Emit one
+                        // block_end now and queue the rest as pending dedents.
+                        result.loc.start = self.index;
+                        var pops: usize = 0;
+                        while (self.indent_depth > pops and self.indent_stack[self.indent_depth - 1 - pops] > indent) {
+                            pops += 1;
+                        }
+                        const new_top = if (self.indent_depth == pops) 0 else self.indent_stack[self.indent_depth - 1 - pops];
+                        if (new_top != indent) continue :state .invalid;
+                        // Pop one level now, queue the rest.
+                        self.indent_depth -= 1;
+                        if (pops > 1) self.pending_dedents = pops - 1;
+                        result.tag = .block_end;
                     }
                 },
             }
@@ -329,7 +407,11 @@ pub fn next(self: *Tokenizer) Error!Token {
         },
         .string => {
             self.index += 1;
-            switch (self.source[self.index]) {
+            const c = self.source[self.index];
+            if (c == self.string_quote) {
+                self.index += 1;
+                result.tag = .string;
+            } else switch (c) {
                 0 => {
                     if (self.index != self.source.len) {
                         continue :state .invalid;
@@ -339,10 +421,6 @@ pub fn next(self: *Tokenizer) Error!Token {
                 },
                 '\n' => result.tag = .invalid,
                 '\\' => continue :state .string_escape_char,
-                '"' => {
-                    self.index += 1;
-                    result.tag = .string;
-                },
                 // Control characters are not allowed in strings.
                 0x01...0x09, 0x0b...0x1f, 0x7f => {
                     continue :state .invalid;
@@ -372,10 +450,21 @@ pub fn next(self: *Tokenizer) Error!Token {
                     self.index += 1;
                     result.tag = .starstar;
                 },
+                '/' => {
+                    if (result.tag != .slash) continue :state .invalid;
+                    self.index += 1;
+                    result.tag = .slash_slash;
+                    continue :state .operator_two_char;
+                },
                 '=' => {
                     switch (result.tag) {
                         .minus => result.tag = .minus_eq,
                         .plus => result.tag = .plus_eq,
+                        .star => result.tag = .star_eq,
+                        .slash => result.tag = .slash_eq,
+                        .slash_slash => result.tag = .slash_slash_eq,
+                        .percent => result.tag = .percent_eq,
+                        .pipe => result.tag = .pipe_eq,
                         .eq => result.tag = .eq_eq,
                         .lt => result.tag = .lt_eq,
                         .gt => result.tag = .gt_eq,
@@ -520,6 +609,97 @@ test Tokenizer {
         try Test.expectToken(&tokenizer, .{ .tag = .colon,          .text = ":" });
         try Test.expectToken(&tokenizer, .{ .tag = .number_literal, .text = "123" });
         try Test.expectToken(&tokenizer, .{ .tag = .r_brace,        .text = "}" });
+        // zig fmt: on
+    }
+    {
+        const code: [:0]const u8 =
+            \\'foo'
+            \\"can't"
+            \\'say "hi"'
+            \\'don\'t'
+            \\"a\"b"
+            \\''
+            \\""
+        ;
+
+        var tokenizer = Tokenizer.init(code);
+
+        // zig fmt: off
+        try Test.expectToken(&tokenizer, .{ .tag = .string, .text = "'foo'" });
+        try Test.expectToken(&tokenizer, .{ .tag = .string, .text = "\"can't\"" });
+        try Test.expectToken(&tokenizer, .{ .tag = .string, .text = "'say \"hi\"'" });
+        try Test.expectToken(&tokenizer, .{ .tag = .string, .text = "'don\\'t'" });
+        try Test.expectToken(&tokenizer, .{ .tag = .string, .text = "\"a\\\"b\"" });
+        try Test.expectToken(&tokenizer, .{ .tag = .string, .text = "''" });
+        try Test.expectToken(&tokenizer, .{ .tag = .string, .text = "\"\"" });
+        try Test.expectToken(&tokenizer, .{ .tag = .eof,    .text = "" });
+        // zig fmt: on
+    }
+    {
+        const code: [:0]const u8 =
+            \\{'k': "v"}
+        ;
+
+        var tokenizer = Tokenizer.init(code);
+
+        // zig fmt: off
+        try Test.expectToken(&tokenizer, .{ .tag = .l_brace, .text = "{" });
+        try Test.expectToken(&tokenizer, .{ .tag = .string,  .text = "'k'" });
+        try Test.expectToken(&tokenizer, .{ .tag = .colon,   .text = ":" });
+        try Test.expectToken(&tokenizer, .{ .tag = .string,  .text = "\"v\"" });
+        try Test.expectToken(&tokenizer, .{ .tag = .r_brace, .text = "}" });
+        // zig fmt: on
+    }
+    {
+        // Tab indentation: each tab advances to the next multiple of 8 columns.
+        // First body uses 4 spaces (indent_size=4); inner body uses one tab
+        // (column 8) which is a valid 2x indent_size.
+        const code: [:0]const u8 = "def f():\n    if x:\n\tpass\n";
+
+        var tokenizer = Tokenizer.init(code);
+
+        // zig fmt: off
+        try Test.expectToken(&tokenizer, .{ .tag = .keyword_def,    .text = "def" });
+        try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "f" });
+        try Test.expectToken(&tokenizer, .{ .tag = .l_paren,        .text = "(" });
+        try Test.expectToken(&tokenizer, .{ .tag = .r_paren,        .text = ")" });
+        try Test.expectToken(&tokenizer, .{ .tag = .colon,          .text = ":" });
+        try Test.expectToken(&tokenizer, .{ .tag = .block_start,    .text = "\n    " });
+        try Test.expectToken(&tokenizer, .{ .tag = .keyword_if,     .text = "if" });
+        try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "x" });
+        try Test.expectToken(&tokenizer, .{ .tag = .colon,          .text = ":" });
+        try Test.expectToken(&tokenizer, .{ .tag = .block_start,    .text = "\n\t" });
+        try Test.expectToken(&tokenizer, .{ .tag = .keyword_pass,   .text = "pass" });
+        try Test.expectToken(&tokenizer, .{ .tag = .block_end,      .text = "" });
+        try Test.expectToken(&tokenizer, .{ .tag = .block_end,      .text = "" });
+        try Test.expectToken(&tokenizer, .{ .tag = .eof,            .text = "" });
+        // zig fmt: on
+    }
+    {
+        const code: [:0]const u8 =
+            \\a / b
+            \\a // b
+            \\a | b
+            \\lambda x: x
+        ;
+
+        var tokenizer = Tokenizer.init(code);
+
+        // zig fmt: off
+        try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "a" });
+        try Test.expectToken(&tokenizer, .{ .tag = .slash,          .text = "/" });
+        try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "b" });
+        try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "a" });
+        try Test.expectToken(&tokenizer, .{ .tag = .slash_slash,    .text = "//" });
+        try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "b" });
+        try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "a" });
+        try Test.expectToken(&tokenizer, .{ .tag = .pipe,           .text = "|" });
+        try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "b" });
+        try Test.expectToken(&tokenizer, .{ .tag = .keyword_lambda, .text = "lambda" });
+        try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "x" });
+        try Test.expectToken(&tokenizer, .{ .tag = .colon,          .text = ":" });
+        try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "x" });
+        try Test.expectToken(&tokenizer, .{ .tag = .eof,            .text = "" });
         // zig fmt: on
     }
 }

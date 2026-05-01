@@ -93,6 +93,10 @@ fn currentTag(self: *Parser) ?Token.Tag {
     return self.tokenTag(self.token_idx);
 }
 
+fn peekTag(self: *Parser, offset: u32) ?Token.Tag {
+    return self.tokenTag(self.token_idx + offset);
+}
+
 fn tokenIdx(self: *Parser) Token.Index {
     return @enumFromInt(self.token_idx);
 }
@@ -151,10 +155,13 @@ pub fn blockExpr(self: *Parser, comptime opts: BlockOpts) !Node.Index {
 }
 
 pub fn parseFnArgs(self: *Parser) Error!Node.Index {
+    const main_token = try self.expectConsume(.l_paren);
+    return self.parseParamList(main_token, .r_paren);
+}
+
+fn parseParamList(self: *Parser, main_token: Token.Index, terminator: Token.Tag) Error!Node.Index {
     const old_len = self.scratch.items.len;
     defer self.scratch.shrinkRetainingCapacity(old_len);
-
-    const main_token = try self.expectConsume(.l_paren);
 
     const fn_args_idx = try self.addNode(.{
         .main_token = main_token,
@@ -162,29 +169,81 @@ pub fn parseFnArgs(self: *Parser) Error!Node.Index {
     });
 
     while (true) {
+        if (self.currentTag() == terminator) break;
         if (self.consume(.identifier)) |arg_name| {
+            const default_val: Ast.Node.Index = if (self.consume(.eq)) |_|
+                try self.expectExpr()
+            else
+                .none;
             try self.scratch.append(self.gpa, try self.addNode(.{
                 .main_token = arg_name,
-                .data = .{ .fn_arg = .{ .binding = arg_name } },
+                .data = .{ .fn_arg = .{ .binding = arg_name, .default = default_val } },
             }));
         }
         switch (self.currentTag() orelse return self.fail(.unexpected_eof)) {
             .comma => self.advance(),
-            .r_paren => {
-                self.advance(); // already checked r_paren
-                const scratch_statements = self.scratch.items[old_len..];
-                if (scratch_statements.len == 0) return fn_args_idx;
-                const statements = try self.arena.allocator().dupe(Node.Index, scratch_statements);
-                self.nodeData(fn_args_idx).fn_args.positional = statements;
-                return fn_args_idx;
+            else => |t| {
+                if (t == terminator) break;
+                return self.fail(.expected_fn_arg);
             },
-            else => return self.fail(.expected_fn_arg),
         }
     }
+    _ = try self.expectConsume(terminator);
+
+    const scratch_statements = self.scratch.items[old_len..];
+    if (scratch_statements.len == 0) return fn_args_idx;
+    const statements = try self.arena.allocator().dupe(Node.Index, scratch_statements);
+    self.nodeData(fn_args_idx).fn_args.positional = statements;
+    return fn_args_idx;
 }
 
 pub fn expectExpr(self: *Parser) Error!Node.Index {
-    return try self.parseExpr(0) orelse self.fail(.expected_expr);
+    const lhs = try self.parseExpr(0) orelse return self.fail(.expected_expr);
+    // If expression `<then> if <cond> else <else>` is the
+    // lowest-precedence expression form. We attach it here, at the outermost
+    // expression boundary, after the operator-precedence loop has consumed
+    // everything else, but only if a matching `else` actually follows.
+    if (self.currentTag() == .keyword_if and self.peekIfIsTernary()) {
+        const if_tok = self.consumeNext();
+        const cond = try self.parseExpr(0) orelse return self.fail(.expected_expr);
+        _ = try self.expectConsume(.keyword_else);
+        const else_branch = try self.expectExpr();
+        return try self.addNode(.{
+            .main_token = if_tok,
+            .data = .{ .if_expression = .{
+                .condition = cond,
+                .then_branch = lhs,
+                .else_branch = else_branch,
+            } },
+        });
+    }
+    return lhs;
+}
+
+/// Heuristic peek: starting at the current `keyword_if`, decide whether it's
+/// a ternary suffix (`...if cond else value`) or the start of a new
+/// statement (`if cond: ...`). We scan forward through balanced
+/// parens/brackets/braces; the first un-balanced `keyword_else` means
+/// ternary, the first un-balanced `colon` or `block_start`/`block_end`/`eof`
+/// means statement.
+fn peekIfIsTernary(self: *Parser) bool {
+    var i: u32 = self.token_idx + 1; // start past `if`
+    var depth: u32 = 0;
+    const tags = self.tokens.items(.tag);
+    while (i < tags.len) : (i += 1) {
+        const t = tags[i];
+        switch (t) {
+            .l_paren, .l_bracket, .l_brace => depth += 1,
+            .r_paren, .r_bracket, .r_brace => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            .keyword_else => if (depth == 0) return true,
+            .colon, .block_start, .block_end, .eof => if (depth == 0) return false,
+            else => {},
+        }
+    }
+    return false;
 }
 
 // const Assoc = enum {
@@ -200,8 +259,10 @@ const OperInfo = struct {
 
 const operTable = std.enums.directEnumArrayDefault(Token.Tag, OperInfo, .{ .prec = -1, .tag = Node.Tag.block }, 0, .{
     .keyword_or = .{ .prec = 10, .tag = .bool_or },
+    .pipe = .{ .prec = 15, .tag = .bit_or },
     .keyword_and = .{ .prec = 20, .tag = .bool_and },
 
+    .keyword_in = .{ .prec = 25, .tag = .contains },
     .eq_eq = .{ .prec = 25, .tag = .eq },
     .bang_eq = .{ .prec = 25, .tag = .ne },
     .lt = .{ .prec = 25, .tag = .lt },
@@ -213,6 +274,9 @@ const operTable = std.enums.directEnumArrayDefault(Token.Tag, OperInfo, .{ .prec
     .minus = .{ .prec = 30, .tag = .sub },
 
     .star = .{ .prec = 40, .tag = .mul },
+    .slash = .{ .prec = 40, .tag = .div },
+    .slash_slash = .{ .prec = 40, .tag = .floor_div },
+    .percent = .{ .prec = 40, .tag = .mod },
 });
 
 pub fn parseExpr(self: *Parser, min_prec: i32) Error!?Node.Index {
@@ -223,7 +287,13 @@ pub fn parseExpr(self: *Parser, min_prec: i32) Error!?Node.Index {
 
     while (true) {
         const tok_tag = self.currentTag() orelse return error.ParseError;
-        const info = operTable[@as(usize, @intCast(@intFromEnum(tok_tag)))];
+
+        // `not in` is a two-token operator at `in`'s precedence; treat it as
+        // `in` for dispatch and wrap the resulting node in `not` afterwards.
+        const is_not_in = tok_tag == .keyword_not and self.peekTag(1) == .keyword_in;
+        const op_tag = if (is_not_in) Token.Tag.keyword_in else tok_tag;
+
+        const info = operTable[@intFromEnum(op_tag)];
         if (info.prec < min_prec) {
             break;
         }
@@ -232,6 +302,7 @@ pub fn parseExpr(self: *Parser, min_prec: i32) Error!?Node.Index {
         // }
 
         const oper_token = self.consumeNext();
+        if (is_not_in) self.advance(); // consume the trailing `in`
 
         const rhs = try self.parseExpr(info.prec + 1) orelse {
             try self.warn(.expected_expr);
@@ -249,6 +320,11 @@ pub fn parseExpr(self: *Parser, min_prec: i32) Error!?Node.Index {
                 } else return self.fail(.expected_operator);
             },
         }
+
+        if (is_not_in) node = try self.addNode(.{
+            .main_token = oper_token,
+            .data = .{ .bool_not = node },
+        });
 
         // if (info.assoc == Assoc.none) {
         //     banned_prec = info.prec;
@@ -278,6 +354,37 @@ pub fn parseExprWithoutOperators(self: *Parser) Error!?Node.Index {
                     const value = try self.expectExpr();
                     self.nodeData(node_idx).var_definition.value = value;
                     break :blk node_idx;
+                } else if (self.consumeOneOf(&.{ .plus_eq, .minus_eq, .star_eq, .slash_eq, .slash_slash_eq, .percent_eq, .pipe_eq })) |op_tok| {
+                    // Desugar `x <op>= y` to `x = x <op> y`. Only valid for
+                    // identifier LHS, which is all we support today.
+                    const op_tag = self.tokens.items(.tag)[@intFromEnum(op_tok)];
+                    const lhs_ident = try self.addNode(.{
+                        .data = .{ .identifier = {} },
+                        .main_token = ident,
+                    });
+                    const def_node = try self.addNode(.{
+                        .data = .{
+                            .var_definition = .{
+                                .binding = ident,
+                                .value = undefined,
+                            },
+                        },
+                        .main_token = ident,
+                    });
+                    errdefer self.nodes.orderedRemove(@intFromEnum(def_node));
+                    const rhs = try self.expectExpr();
+                    const binop_node = try self.addNode(switch (op_tag) {
+                        .plus_eq => .{ .main_token = op_tok, .data = .{ .add = .{ .lhs = lhs_ident, .rhs = rhs } } },
+                        .minus_eq => .{ .main_token = op_tok, .data = .{ .sub = .{ .lhs = lhs_ident, .rhs = rhs } } },
+                        .star_eq => .{ .main_token = op_tok, .data = .{ .mul = .{ .lhs = lhs_ident, .rhs = rhs } } },
+                        .slash_eq => .{ .main_token = op_tok, .data = .{ .div = .{ .lhs = lhs_ident, .rhs = rhs } } },
+                        .slash_slash_eq => .{ .main_token = op_tok, .data = .{ .floor_div = .{ .lhs = lhs_ident, .rhs = rhs } } },
+                        .percent_eq => .{ .main_token = op_tok, .data = .{ .mod = .{ .lhs = lhs_ident, .rhs = rhs } } },
+                        .pipe_eq => .{ .main_token = op_tok, .data = .{ .bit_or = .{ .lhs = lhs_ident, .rhs = rhs } } },
+                        else => unreachable,
+                    });
+                    self.nodeData(def_node).var_definition.value = binop_node;
+                    break :blk def_node;
                 } else {
                     break :blk try self.addNode(.{
                         .data = .{ .identifier = {} },
@@ -285,7 +392,7 @@ pub fn parseExprWithoutOperators(self: *Parser) Error!?Node.Index {
                     });
                 }
             },
-            .number_literal, .string, .keyword_true, .keyword_false => {
+            .number_literal, .string, .keyword_true, .keyword_false, .keyword_none => {
                 const num = self.consumeNext();
                 break :blk try self.addNode(.{
                     .data = .{ .literal = {} },
@@ -312,6 +419,9 @@ pub fn parseExprWithoutOperators(self: *Parser) Error!?Node.Index {
             .keyword_for => {
                 break :blk try self.parseForLoop();
             },
+            .keyword_while => {
+                break :blk try self.parseWhileLoop();
+            },
             .keyword_break => {
                 const tok = self.consumeNext();
                 break :blk try self.addNode(.{
@@ -323,6 +433,48 @@ pub fn parseExprWithoutOperators(self: *Parser) Error!?Node.Index {
                 const tok = self.consumeNext();
                 break :blk try self.addNode(.{
                     .data = .{ .@"continue" = {} },
+                    .main_token = tok,
+                });
+            },
+            .l_paren => {
+                const lparen = self.consumeNext();
+                // Empty tuple ()
+                if (self.currentTag() == .r_paren) {
+                    self.advance();
+                    break :blk try self.addNode(.{
+                        .main_token = lparen,
+                        .data = .{ .tuple_literal = .{ .elements = &.{} } },
+                    });
+                }
+                // Parse first expression
+                const first = try self.expectExpr();
+                if (self.currentTag() == .r_paren) {
+                    // (expr) — grouping parens, not a tuple
+                    self.advance();
+                    break :blk first;
+                }
+                if (self.currentTag() == .comma) {
+                    // (expr, ...) — tuple
+                    const old_len = self.scratch.items.len;
+                    defer self.scratch.shrinkRetainingCapacity(old_len);
+                    try self.scratch.append(self.gpa, first);
+                    while (self.consume(.comma)) |_| {
+                        if (self.currentTag() == .r_paren) break;
+                        try self.scratch.append(self.gpa, try self.expectExpr());
+                    }
+                    _ = try self.expectConsume(.r_paren);
+                    const elements = try self.arena.allocator().dupe(Node.Index, self.scratch.items[old_len..]);
+                    break :blk try self.addNode(.{
+                        .main_token = lparen,
+                        .data = .{ .tuple_literal = .{ .elements = elements } },
+                    });
+                }
+                return self.fail(.expected_expr);
+            },
+            .keyword_pass => {
+                const tok = self.consumeNext();
+                break :blk try self.addNode(.{
+                    .data = .{ .pass = {} },
                     .main_token = tok,
                 });
             },
@@ -359,6 +511,24 @@ pub fn parseExprWithoutOperators(self: *Parser) Error!?Node.Index {
                 self.nodeData(node_idx).@"return" = value;
                 break :blk node_idx;
             },
+            .keyword_lambda => {
+                const lambda_tok = self.consumeNext();
+                const args = try self.parseParamList(lambda_tok, .colon);
+                const body_expr = try self.expectExpr();
+                const ret_node = try self.addNode(.{
+                    .main_token = lambda_tok,
+                    .data = .{ .@"return" = body_expr },
+                });
+                const stmts = try self.arena.allocator().dupe(Node.Index, &.{ret_node});
+                const block_node = try self.addNode(.{
+                    .main_token = lambda_tok,
+                    .data = .{ .block = .{ .statements = stmts } },
+                });
+                break :blk try self.addNode(.{
+                    .main_token = lambda_tok,
+                    .data = .{ .lambda = .{ .args = args, .body = block_node } },
+                });
+            },
             else => return self.fail(.expected_expr),
         };
 
@@ -375,32 +545,41 @@ pub fn parseExprWithoutOperators(self: *Parser) Error!?Node.Index {
 fn parseSuffix(self: *Parser, expr_idx: Node.Index) !?Node.Index {
     // Function calls
     if (self.consume(.l_paren)) |lparen| {
-        const old_len = self.scratch.items.len;
-        defer self.scratch.shrinkRetainingCapacity(old_len);
+        const pos_old_len = self.scratch.items.len;
+        defer self.scratch.shrinkRetainingCapacity(pos_old_len);
+        var kwargs_buf: std.ArrayList(Ast.KwArg) = .empty;
+        defer kwargs_buf.deinit(self.gpa);
 
-        // Parse arguments
+        // Parse arguments. A kwarg is any `<name> = <expr>` pair; positional
+        // args are bare expressions. In a call-argument position `=` cannot
+        // appear inside an expression, so peeking for `=` is unambiguous —
+        // and accepts any token (including keywords) as the kwarg name, which
+        // matches starlark-go's behaviour for `true=value` etc.
         while (true) {
-            if (self.currentTag() == .r_paren) {
-                break;
-            }
+            if (self.currentTag() == .r_paren) break;
 
-            const arg = try self.expectExpr();
-            try self.scratch.append(self.gpa, arg);
-
-            if (self.consume(.comma)) |_| {
-                continue;
-            } else if (self.currentTag() == .r_paren) {
-                break;
+            if (self.peekTag(1) == .eq) {
+                const name_tok = self.consumeNext();
+                self.advance(); // consume `=`
+                const val = try self.expectExpr();
+                try kwargs_buf.append(self.gpa, .{ .name = name_tok, .value = val });
             } else {
-                return self.fail(.expected_expr);
+                try self.scratch.append(self.gpa, try self.expectExpr());
             }
+
+            if (self.consume(.comma)) |_| continue;
+            if (self.currentTag() == .r_paren) break;
+            return self.fail(.expected_expr);
         }
 
         _ = try self.expectConsume(.r_paren);
 
-        const args_slice = try self.arena.allocator().dupe(Node.Index, self.scratch.items[old_len..]);
+        const arena = self.arena.allocator();
         const args_node = try self.addNode(.{
-            .data = .{ .call_args = .{ .args = args_slice } },
+            .data = .{ .call_args = .{
+                .args = try arena.dupe(Ast.Node.Index, self.scratch.items[pos_old_len..]),
+                .kwargs = try arena.dupe(Ast.KwArg, kwargs_buf.items),
+            } },
             .main_token = lparen,
         });
 
@@ -562,6 +741,23 @@ fn parseForLoop(self: *Parser) Error!Node.Index {
             .@"for" = .{
                 .binding = binding,
                 .iterable = iterable,
+                .body = body,
+            },
+        },
+    });
+}
+
+fn parseWhileLoop(self: *Parser) Error!Node.Index {
+    const while_tok = try self.expectConsume(.keyword_while);
+    const condition = try self.expectExpr();
+    _ = try self.expectConsume(.colon);
+    const body = try self.blockExpr(.{});
+
+    return try self.addNode(.{
+        .main_token = while_tok,
+        .data = .{
+            .@"while" = .{
+                .condition = condition,
                 .body = body,
             },
         },

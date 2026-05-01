@@ -21,6 +21,8 @@ pub const Module = struct {
     code: []Runtime.Instruction,
     constants: []*Runtime.StarObj,
     global_names: [][]const u8,
+    /// Pool of kwarg names referenced by `call_kw` instructions in `code`.
+    kw_names: [][]const u8,
     /// Reference to original source code
     source: [:0]const u8,
     /// Source locations parallel to code
@@ -117,6 +119,9 @@ const CodeBuilder = struct {
     code: std.ArrayList(Runtime.Instruction) = .empty,
     constants: std.ArrayList(*Runtime.StarObj) = .empty,
     const_map: std.AutoHashMapUnmanaged(*Runtime.StarObj, Runtime.ConstIdx) = .empty,
+    /// Flat pool of kwarg names referenced by `call_kw` instructions emitted
+    /// into `code`. Each `call_kw` carries `(start, count)` indices into this.
+    kw_names: std.ArrayList([]const u8) = .empty,
     source_locs: std.ArrayList(Runtime.SourceLoc) = .empty,
     interner: *StringInterner,
     current_loc: Runtime.SourceLoc = Runtime.SourceLoc.none,
@@ -154,6 +159,8 @@ const CodeBuilder = struct {
             .jump_if_false => .{ .jump_if_false = 0 },
             .jump_if_true => .{ .jump_if_true = 0 },
             .for_iter => .{ .for_iter = 0 },
+            .and_jump => .{ .and_jump = 0 },
+            .or_jump => .{ .or_jump = 0 },
         });
         try self.source_locs.append(self.gc, self.current_loc);
         return idx;
@@ -168,6 +175,8 @@ const CodeBuilder = struct {
             .jump_if_false => .{ .jump_if_false = offset },
             .jump_if_true => .{ .jump_if_true = offset },
             .for_iter => .{ .for_iter = offset },
+            .and_jump => .{ .and_jump = offset },
+            .or_jump => .{ .or_jump = offset },
             else => unreachable,
         };
     }
@@ -176,7 +185,7 @@ const CodeBuilder = struct {
         return self.code.items.len;
     }
 
-    const JumpTag = enum { jump, jump_if_false, jump_if_true, for_iter };
+    const JumpTag = enum { jump, jump_if_false, jump_if_true, for_iter, and_jump, or_jump };
 
     inline fn addConst(self: *@This(), obj: *Runtime.StarObj) !Runtime.ConstIdx {
         const gop = try self.const_map.getOrPut(self.gc, obj);
@@ -225,6 +234,9 @@ const FunctionCompiler = struct {
 
     inline fn defineLocal(self: *FunctionCompiler, name: []const u8) !Runtime.LocalIdx {
         const interned = try self.base.internString(name);
+        if (self.scope.resolveLocal(interned)) |entry| {
+            if (entry.kind == .local) return @enumFromInt(entry.index);
+        }
         const idx: u32 = @intCast(self.local_names.items.len);
         try self.local_names.append(self.base.gc, interned);
         try self.scope.define(interned, .{ .kind = .local, .index = idx });
@@ -322,6 +334,143 @@ const ModuleCompiler = struct {
     }
 };
 
+/// Emit the bytecode that materializes the function described by `d` at
+/// runtime: evaluates each default-value expression in the enclosing scope,
+/// then emits `make_function` (or `load_const` when there is nothing to bind).
+/// Returns the function name as a slice of `source`.
+fn compileDefProto(
+    ast: *const Ast,
+    source: [:0]const u8,
+    builder: *CodeBuilder,
+    scope: *Scope,
+    func_compiler: ?*FunctionCompiler,
+    module_compiler: ?*ModuleCompiler,
+    gc: Allocator,
+    arena: Allocator,
+    interner: *StringInterner,
+    d: @FieldType(Ast.Node.Data, "def_proto"),
+) Error!struct { name: []const u8, func: *Runtime.StarFunc } {
+    const name_tok = ast.tokens.get(@intFromEnum(d.name));
+    const fn_name = source[name_tok.loc.start..name_tok.loc.end];
+    const func = try emitFunctionLiteral(ast, source, builder, scope, func_compiler, module_compiler, gc, arena, interner, d.args, d.body, fn_name);
+    return .{ .name = fn_name, .func = func };
+}
+
+fn emitFunctionLiteral(
+    ast: *const Ast,
+    source: [:0]const u8,
+    builder: *CodeBuilder,
+    scope: *Scope,
+    func_compiler: ?*FunctionCompiler,
+    module_compiler: ?*ModuleCompiler,
+    gc: Allocator,
+    arena: Allocator,
+    interner: *StringInterner,
+    args_idx: Ast.Node.Index,
+    body_idx: Ast.Node.Index,
+    fn_name: []const u8,
+) Error!*Runtime.StarFunc {
+    const parent_scope = if (func_compiler) |fc| &fc.scope else if (module_compiler) |mc| &mc.scope else unreachable;
+
+    const nested = try compileFunction(gc, arena, ast, source, interner, parent_scope, body_idx, args_idx, fn_name);
+    const func_idx = try builder.addConst(&nested.obj);
+
+    // Push each default-value expression in declaration order so the runtime
+    // can pop them and bind them to the rightmost parameters.
+    var num_defaults: u16 = 0;
+    const fn_args = ast.nodes.get(@intFromEnum(args_idx)).data.fn_args.positional;
+    for (fn_args) |arg_idx| {
+        const default = ast.nodes.get(@intFromEnum(arg_idx)).data.fn_arg.default;
+        if (default == .none) continue;
+        try compileExpr(ast, source, builder, scope, default, func_compiler, module_compiler);
+        num_defaults += 1;
+    }
+
+    if (num_defaults == 0 and nested.names_free.len == 0) {
+        try builder.emit(.{ .load_const = func_idx });
+    } else {
+        try builder.emit(.{ .make_function = .{ .const_idx = func_idx, .num_defaults = num_defaults } });
+    }
+
+    return nested;
+}
+
+/// Returns true if `tag` is an expression node that may appear as a statement
+/// (where it is compiled and the result popped). Statements that are not
+/// expressions (e.g. `if`, `for`, `def`, `return`) are handled in their own
+/// switch arms before this is consulted.
+fn isExpressionTag(tag: Ast.Node.Tag) bool {
+    return switch (tag) {
+        .call,
+        .add,
+        .sub,
+        .mul,
+        .div,
+        .floor_div,
+        .bit_or,
+        .eq,
+        .ne,
+        .lt,
+        .le,
+        .gt,
+        .ge,
+        .mod,
+        .contains,
+        .literal,
+        .identifier,
+        .list_literal,
+        .tuple_literal,
+        .dict_literal,
+        .index,
+        .bool_not,
+        .bool_and,
+        .bool_or,
+        .get_attribute,
+        .lambda,
+        .if_expression,
+        => true,
+        else => false,
+    };
+}
+
+/// Parse a Starlark string literal (either `"..."` or `'...'`) into its decoded bytes.
+/// Delegates to std.zig.string_literal.parseAlloc, which requires `"`-delimited input,
+/// rewriting single-quoted literals into double-quoted form first.
+fn parseStarlarkString(gc: Allocator, literal: []const u8) ![]u8 {
+    if (literal.len < 2) return error.LiteralInvalid;
+    if (literal[0] == '"') {
+        return std.zig.string_literal.parseAlloc(gc, literal) catch error.LiteralInvalid;
+    }
+    if (literal[0] != '\'') return error.LiteralInvalid;
+
+    // Worst case: every char becomes 2 (literal `"` -> `\"`).
+    var buf = try std.ArrayList(u8).initCapacity(gc, literal.len * 2);
+    defer buf.deinit(gc);
+    try buf.append(gc, '"');
+    var i: usize = 1;
+    const body_end = literal.len - 1;
+    while (i < body_end) : (i += 1) {
+        const c = literal[i];
+        if (c == '\\' and i + 1 < body_end) {
+            const next = literal[i + 1];
+            if (next == '\'') {
+                try buf.append(gc, '\'');
+            } else {
+                try buf.append(gc, '\\');
+                try buf.append(gc, next);
+            }
+            i += 1;
+        } else if (c == '"') {
+            try buf.append(gc, '\\');
+            try buf.append(gc, '"');
+        } else {
+            try buf.append(gc, c);
+        }
+    }
+    try buf.append(gc, '"');
+    return std.zig.string_literal.parseAlloc(gc, buf.items) catch error.LiteralInvalid;
+}
+
 inline fn compileLiteral(
     builder: *CodeBuilder,
     ast: *const Ast,
@@ -345,8 +494,7 @@ inline fn compileLiteral(
         },
         .string => {
             const string_literal = source[token.loc.start..token.loc.end];
-            // Parse string literal directly with gc allocator
-            const str_parsed = std.zig.string_literal.parseAlloc(builder.gc, string_literal) catch return error.LiteralInvalid;
+            const str_parsed = parseStarlarkString(builder.gc, string_literal) catch return error.LiteralInvalid;
             defer builder.gc.free(str_parsed);
             const interned = try builder.internString(str_parsed);
             const str_star = try Runtime.StarStr.init(builder.gc, interned);
@@ -354,6 +502,7 @@ inline fn compileLiteral(
         },
         .keyword_true => return Runtime.StarBool.get(true),
         .keyword_false => return Runtime.StarBool.get(false),
+        .keyword_none => return Runtime.StarNone.instance,
         else => return error.LiteralInvalid,
     }
 }
@@ -376,6 +525,7 @@ fn compileExpr(
             emit_getattr,
             emit_bool_not,
             emit_build_list,
+            emit_build_tuple,
             emit_build_dict,
             emit_get_index,
         },
@@ -429,23 +579,74 @@ fn compileExpr(
                     .call => |c| {
                         const args_node = ast.nodes.get(@intFromEnum(c.args));
                         if (args_node.data != .call_args) return error.AstInvalid;
+                        const call_args = args_node.data.call_args;
 
-                        const arity: u32 = @intCast(args_node.data.call_args.args.len);
-
-                        try work_stack.appendBounded(.{ .kind = .emit_call, .node_idx = work.node_idx, .extra = arity });
-
-                        var i: usize = args_node.data.call_args.args.len;
-                        while (i > 0) {
-                            i -= 1;
-                            try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = args_node.data.call_args.args[i] });
+                        if (call_args.kwargs.len > 0) {
+                            // Kwarg call: compile func, positional, then kwarg values inline.
+                            // Done outside the work stack because we need to emit the
+                            // call_kw instruction with kwarg-name metadata after compilation.
+                            try compileExpr(ast, source, builder, scope, c.func, func_compiler, module_compiler);
+                            for (call_args.args) |arg_idx|
+                                try compileExpr(ast, source, builder, scope, arg_idx, func_compiler, module_compiler);
+                            const kw_names_start: Runtime.KwNamesIdx = @enumFromInt(builder.kw_names.items.len);
+                            for (call_args.kwargs) |kw| {
+                                try compileExpr(ast, source, builder, scope, kw.value, func_compiler, module_compiler);
+                                const tok = ast.tokens.get(@intFromEnum(kw.name));
+                                try builder.kw_names.append(builder.gc, source[tok.loc.start..tok.loc.end]);
+                            }
+                            try builder.emit(.{ .call_kw = .{
+                                .pos_arity = @intCast(call_args.args.len),
+                                .kw_names_start = kw_names_start,
+                                .kw_count = @intCast(call_args.kwargs.len),
+                            } });
+                        } else {
+                            try work_stack.appendBounded(.{ .kind = .emit_call, .node_idx = work.node_idx, .extra = @intCast(call_args.args.len) });
+                            var i: usize = call_args.args.len;
+                            while (i > 0) : (i -= 1) {
+                                try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = call_args.args[i - 1] });
+                            }
+                            try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = c.func });
                         }
-
-                        try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = c.func });
                     },
-                    .add, .sub, .mul, .eq, .ne, .lt, .le, .gt, .ge => |binop| {
+                    .add, .sub, .mul, .div, .floor_div, .bit_or, .eq, .ne, .lt, .le, .gt, .ge, .mod => |binop| {
                         try work_stack.appendBounded(.{ .kind = .emit_binop, .node_idx = work.node_idx });
                         try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = binop.rhs });
                         try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = binop.lhs });
+                    },
+                    .contains => |binop| {
+                        // `a in b` semantically calls `b.__contains__(a)`. By compiling
+                        // the operands in reverse here, the binary_op dispatch can stay
+                        // uniform: lhs becomes the haystack (receiver), rhs the needle.
+                        try work_stack.appendBounded(.{ .kind = .emit_binop, .node_idx = work.node_idx });
+                        try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = binop.lhs });
+                        try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = binop.rhs });
+                    },
+                    .bool_and => |binop| {
+                        // Short-circuit: eval LHS, and_jump over RHS if falsy
+                        try compileExpr(ast, source, builder, scope, binop.lhs, func_compiler, module_compiler);
+                        const jump_idx = try builder.emitJump(.and_jump);
+                        try compileExpr(ast, source, builder, scope, binop.rhs, func_compiler, module_compiler);
+                        builder.patchJump(jump_idx);
+                    },
+                    .bool_or => |binop| {
+                        // Short-circuit: eval LHS, or_jump over RHS if truthy
+                        try compileExpr(ast, source, builder, scope, binop.lhs, func_compiler, module_compiler);
+                        const jump_idx = try builder.emitJump(.or_jump);
+                        try compileExpr(ast, source, builder, scope, binop.rhs, func_compiler, module_compiler);
+                        builder.patchJump(jump_idx);
+                    },
+                    .if_expression => |cond| {
+                        // `then if condition else else_`. Standard branch:
+                        //   eval condition; jump_if_false to ELSE;
+                        //   eval then; jump END;
+                        //   ELSE: eval else_; END:
+                        try compileExpr(ast, source, builder, scope, cond.condition, func_compiler, module_compiler);
+                        const jump_to_else = try builder.emitJump(.jump_if_false);
+                        try compileExpr(ast, source, builder, scope, cond.then_branch, func_compiler, module_compiler);
+                        const jump_to_end = try builder.emitJump(.jump);
+                        builder.patchJump(jump_to_else);
+                        try compileExpr(ast, source, builder, scope, cond.else_branch, func_compiler, module_compiler);
+                        builder.patchJump(jump_to_end);
                     },
                     .bool_not => |operand| {
                         try work_stack.appendBounded(.{ .kind = .emit_bool_not, .node_idx = work.node_idx });
@@ -463,6 +664,14 @@ fn compileExpr(
                             try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = ll.elements[i] });
                         }
                     },
+                    .tuple_literal => |tl| {
+                        try work_stack.appendBounded(.{ .kind = .emit_build_tuple, .node_idx = work.node_idx, .extra = @intCast(tl.elements.len) });
+                        var i: usize = tl.elements.len;
+                        while (i > 0) {
+                            i -= 1;
+                            try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = tl.elements[i] });
+                        }
+                    },
                     .dict_literal => |dl| {
                         try work_stack.appendBounded(.{ .kind = .emit_build_dict, .node_idx = work.node_idx, .extra = @intCast(dl.keys.len) });
                         var i: usize = dl.keys.len;
@@ -476,6 +685,10 @@ fn compileExpr(
                         try work_stack.appendBounded(.{ .kind = .emit_get_index, .node_idx = work.node_idx });
                         try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = idx.idx });
                         try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = idx.obj });
+                    },
+                    .lambda => |l| {
+                        const arena_alloc: Allocator = if (func_compiler) |fc| fc.arena else if (module_compiler) |mc| mc.arena else unreachable;
+                        _ = try emitFunctionLiteral(ast, source, builder, scope, func_compiler, module_compiler, builder.gc, arena_alloc, builder.interner, l.args, l.body, "<lambda>");
                     },
                     else => {
                         log.err("Unexpected expression node: {any}", .{std.meta.activeTag(node.data)});
@@ -493,7 +706,7 @@ fn compileExpr(
             .emit_binop => {
                 const binop_node = ast.nodes.get(@intFromEnum(work.node_idx));
                 const binop: Runtime.BinOp = switch (std.meta.activeTag(binop_node.data)) {
-                    inline .add, .sub, .mul, .eq, .ne, .lt, .le, .gt, .ge => |tag| @field(Runtime.BinOp, @tagName(tag)),
+                    inline .add, .sub, .mul, .div, .floor_div, .bit_or, .eq, .ne, .lt, .le, .gt, .ge, .mod, .contains => |tag| @field(Runtime.BinOp, @tagName(tag)),
                     else => unreachable,
                 };
                 try builder.emit(.{ .binary_op = binop });
@@ -503,6 +716,9 @@ fn compileExpr(
             },
             .emit_build_list => {
                 try builder.emit(.{ .build_list = work.extra });
+            },
+            .emit_build_tuple => {
+                try builder.emit(.{ .build_tuple = work.extra });
             },
             .emit_build_dict => {
                 try builder.emit(.{ .build_dict = work.extra });
@@ -615,6 +831,51 @@ fn compileFor(
     try builder.emit(.pop_iter);
 }
 
+fn compileWhile(
+    gc: Allocator,
+    arena: Allocator,
+    ast: *const Ast,
+    source: [:0]const u8,
+    interner: *StringInterner,
+    func_compiler: ?*FunctionCompiler,
+    module_compiler: ?*ModuleCompiler,
+    while_data: @FieldType(Ast.Node.Data, "while"),
+) Error!void {
+    const builder = if (func_compiler) |fc| &fc.base else if (module_compiler) |mc| &mc.base else unreachable;
+    const scope = if (func_compiler) |fc| &fc.scope else if (module_compiler) |mc| &mc.scope else unreachable;
+
+    const loop_start = builder.currentOffset();
+
+    if (func_compiler) |fc| {
+        try fc.loop_stack.append(arena, .{
+            .continue_target = loop_start,
+            .break_patches = .empty,
+        });
+    }
+
+    try compileExpr(ast, source, builder, scope, while_data.condition, func_compiler, module_compiler);
+    const exit_jump = try builder.emitJump(.jump_if_false);
+
+    try compileBlock(gc, arena, ast, source, interner, func_compiler, module_compiler, while_data.body);
+
+    // Jump back to loop start
+    const target: i32 = @intCast(loop_start);
+    const from: i32 = @intCast(builder.currentOffset() + 1);
+    try builder.emit(.{ .jump = target - from });
+
+    // Patch the falsy-exit jump
+    builder.patchJump(exit_jump);
+
+    // Patch breaks
+    if (func_compiler) |fc| {
+        if (fc.loop_stack.pop()) |loop_ctx| {
+            for (loop_ctx.break_patches.items) |patch_idx| {
+                builder.patchJump(patch_idx);
+            }
+        }
+    }
+}
+
 fn compileBlock(
     gc: Allocator,
     arena: Allocator,
@@ -659,25 +920,11 @@ fn compileBlock(
                 }
             },
             .def_proto => |d| {
-                const name_tok = ast.tokens.get(@intFromEnum(d.name));
-                const fn_name = source[name_tok.loc.start..name_tok.loc.end];
-
-                const parent_scope = if (func_compiler) |fc| &fc.scope else if (module_compiler) |mc| &mc.scope else unreachable;
-                const nested_func_obj = try compileFunction(gc, arena, ast, source, interner, parent_scope, d.body, d.args, fn_name);
-                const func_idx = try builder.addConst(&nested_func_obj.obj);
-
-                if (nested_func_obj.names_free.len > 0) {
-                    try builder.emit(.{ .make_closure = func_idx });
-                } else {
-                    try builder.emit(.{ .load_const = func_idx });
-                }
-
+                const result = try compileDefProto(ast, source, builder, scope, func_compiler, module_compiler, gc, arena, interner, d);
                 if (func_compiler) |fc| {
-                    const local_idx = try fc.defineLocal(fn_name);
-                    try builder.emit(.{ .store = local_idx });
+                    try builder.emit(.{ .store = try fc.defineLocal(result.name) });
                 } else if (module_compiler) |mc| {
-                    const global_idx = try mc.defineGlobal(fn_name);
-                    try builder.emit(.{ .store_global = global_idx });
+                    try builder.emit(.{ .store_global = try mc.defineGlobal(result.name) });
                 }
             },
             .@"return" => |ret_expr_idx| {
@@ -689,6 +936,9 @@ fn compileBlock(
             },
             .@"for" => |for_data| {
                 try compileFor(gc, arena, ast, source, interner, func_compiler, module_compiler, for_data, stmt_node.main_token);
+            },
+            .@"while" => |while_data| {
+                try compileWhile(gc, arena, ast, source, interner, func_compiler, module_compiler, while_data);
             },
             .@"break" => {
                 if (func_compiler) |fc| {
@@ -711,13 +961,15 @@ fn compileBlock(
                     return error.AstInvalid;
                 }
             },
-            .call, .add, .sub, .mul, .eq, .ne, .lt, .le, .gt, .ge, .literal, .identifier, .list_literal, .dict_literal, .index, .bool_not, .get_attribute => {
+            .pass => {},
+            else => {
+                const tag = std.meta.activeTag(stmt_node.data);
+                if (!isExpressionTag(tag)) {
+                    log.err("Unexpected statement in block: {any}", .{tag});
+                    return error.AstInvalid;
+                }
                 try compileExpr(ast, source, builder, scope, stmt_idx, func_compiler, module_compiler);
                 try builder.emit(.pop);
-            },
-            else => {
-                log.err("Unexpected statement in block: {any}", .{std.meta.activeTag(stmt_node.data)});
-                return error.AstInvalid;
             },
         }
     }
@@ -742,10 +994,23 @@ fn compileFunction(
 
     func_compiler.arity = fn_args.len;
 
+    // Define each parameter as a local and count required (non-default) params.
+    // Default *values* are not evaluated here — Starlark evaluates them at
+    // function-definition time in the enclosing scope, so the caller's
+    // `make_function` instruction handles that.
+    var num_required: usize = 0;
+    var seen_default = false;
     for (fn_args) |arg_idx| {
         const arg_node = ast.nodes.get(@intFromEnum(arg_idx));
         const arg_tok = ast.tokens.get(@intFromEnum(arg_node.data.fn_arg.binding));
         _ = try func_compiler.defineLocal(source[arg_tok.loc.start..arg_tok.loc.end]);
+
+        if (arg_node.data.fn_arg.default != .none) {
+            seen_default = true;
+        } else {
+            if (seen_default) return Error.AstInvalid; // required param after default
+            num_required += 1;
+        }
     }
 
     const body_node = ast.nodes.get(@intFromEnum(body_idx));
@@ -764,21 +1029,8 @@ fn compileFunction(
                 try func_compiler.base.emit(.{ .store = local_idx });
             },
             .def_proto => |d| {
-                const name_tok = ast.tokens.get(@intFromEnum(d.name));
-                const fn_name = source[name_tok.loc.start..name_tok.loc.end];
-
-                const nested_func_obj = try compileFunction(gc, arena, ast, source, interner, &func_compiler.scope, d.body, d.args, fn_name);
-
-                const func_idx = try func_compiler.base.addConst(&nested_func_obj.obj);
-
-                if (nested_func_obj.names_free.len > 0) {
-                    try func_compiler.base.emit(.{ .make_closure = func_idx });
-                } else {
-                    try func_compiler.base.emit(.{ .load_const = func_idx });
-                }
-
-                const local_idx = try func_compiler.defineLocal(fn_name);
-                try func_compiler.base.emit(.{ .store = local_idx });
+                const result = try compileDefProto(ast, source, &func_compiler.base, &func_compiler.scope, &func_compiler, null, gc, arena, interner, d);
+                try func_compiler.base.emit(.{ .store = try func_compiler.defineLocal(result.name) });
             },
             .@"return" => |ret_expr_idx| {
                 try compileExpr(ast, source, &func_compiler.base, &func_compiler.scope, ret_expr_idx, &func_compiler, null);
@@ -789,6 +1041,9 @@ fn compileFunction(
             },
             .@"for" => |for_data| {
                 try compileFor(gc, arena, ast, source, interner, &func_compiler, null, for_data, stmt_node.main_token);
+            },
+            .@"while" => |while_data| {
+                try compileWhile(gc, arena, ast, source, interner, &func_compiler, null, while_data);
             },
             .@"break" => {
                 if (func_compiler.loop_stack.items.len == 0) return error.AstInvalid;
@@ -803,22 +1058,30 @@ fn compileFunction(
                 const from: i32 = @intCast(func_compiler.base.currentOffset() + 1);
                 try func_compiler.base.emit(.{ .jump = target - from });
             },
-            .call, .add, .sub, .mul, .eq, .ne, .lt, .le, .gt, .ge, .literal, .identifier, .list_literal, .dict_literal, .index, .bool_not => {
+            .pass => {},
+            else => {
+                const tag = std.meta.activeTag(stmt_node.data);
+                if (!isExpressionTag(tag)) {
+                    log.err("Unexpected statement node: {any}", .{tag});
+                    return Error.AstInvalid;
+                }
                 try compileExpr(ast, source, &func_compiler.base, &func_compiler.scope, stmt_idx, &func_compiler, null);
                 try func_compiler.base.emit(.pop);
-            },
-            else => {
-                log.err("Unexpected statement node: {any}", .{std.meta.activeTag(stmt_node.data)});
-                return Error.AstInvalid;
             },
         }
     }
 
     // TODO: This needs to validate all branches for returns first.
-    const last_tag = std.meta.activeTag(func_compiler.base.code.items[func_compiler.base.code.items.len - 1]);
-    if (func_compiler.base.code.items.len == 0 or last_tag != .ret or last_tag != .ret_none) {
+    const code_len = func_compiler.base.code.items.len;
+    const last_tag: ?std.meta.Tag(Runtime.Instruction) = if (code_len == 0)
+        null
+    else
+        std.meta.activeTag(func_compiler.base.code.items[code_len - 1]);
+    if (last_tag == null or (last_tag.? != .ret and last_tag.? != .ret_none)) {
         try func_compiler.base.emit(.ret_none);
     }
+
+    if (func_compiler.local_names.items.len > Runtime.locals_capacity) return Error.AstInvalid;
 
     const func = try gc.create(Runtime.StarFunc);
     func.* = .{
@@ -829,11 +1092,16 @@ fn compileFunction(
         .names_local = try func_compiler.local_names.toOwnedSlice(gc),
         .names_free = try func_compiler.free_names.toOwnedSlice(gc),
         .names_global = try func_compiler.global_names.toOwnedSlice(gc),
+        .kw_names = try func_compiler.base.kw_names.toOwnedSlice(gc),
         .closure_cells = &.{},
         .name = func_name,
         .source_locs = try func_compiler.base.source_locs.toOwnedSlice(gc),
+        // `defaults` is left empty here; the caller's `make_function`
+        // populates it from values it pushed onto the stack.
+        .defaults = &.{},
+        .num_required = num_required,
     };
-    try func.obj.attributes.put(gc, Runtime.dunder.str, &(try Runtime.StarBoundMethod.init(gc, &func.obj, &Runtime.StarFunc.strFn)).obj);
+    try Runtime.StarFunc.setupAttrs(gc, &func.obj);
 
     return func;
 }
@@ -873,20 +1141,8 @@ fn compileModule(
                 try module_compiler.base.emit(.{ .store_global = global_idx });
             },
             .def_proto => |d| {
-                const name_tok = ast.tokens.get(@intFromEnum(d.name));
-                const fn_name = source[name_tok.loc.start..name_tok.loc.end];
-
-                const func_obj = try compileFunction(gc, arena, ast, source, interner, &module_compiler.scope, d.body, d.args, fn_name);
-                const func_idx = try module_compiler.base.addConst(&func_obj.obj);
-
-                if (func_obj.names_free.len > 0) {
-                    try module_compiler.base.emit(.{ .make_closure = func_idx });
-                } else {
-                    try module_compiler.base.emit(.{ .load_const = func_idx });
-                }
-
-                const global_idx = try module_compiler.defineGlobal(fn_name);
-                try module_compiler.base.emit(.{ .store_global = global_idx });
+                const result = try compileDefProto(ast, source, &module_compiler.base, &module_compiler.scope, null, &module_compiler, gc, arena, interner, d);
+                try module_compiler.base.emit(.{ .store_global = try module_compiler.defineGlobal(result.name) });
             },
             .@"return" => return Error.AstInvalid,
             .@"if" => |if_data| {
@@ -895,13 +1151,18 @@ fn compileModule(
             .@"for" => |for_data| {
                 try compileFor(gc, arena, ast, source, interner, null, &module_compiler, for_data, stmt_node.main_token);
             },
-            .call, .add, .sub, .mul, .eq, .ne, .lt, .le, .gt, .ge, .literal, .identifier, .list_literal, .dict_literal, .index, .bool_not, .get_attribute => {
+            .@"while" => |while_data| {
+                try compileWhile(gc, arena, ast, source, interner, null, &module_compiler, while_data);
+            },
+            .pass => {},
+            else => {
+                const tag = std.meta.activeTag(stmt_node.data);
+                if (!isExpressionTag(tag)) {
+                    log.err("Unexpected top-level statement: {any}", .{tag});
+                    return Error.AstInvalid;
+                }
                 try compileExpr(ast, source, &module_compiler.base, &module_compiler.scope, stmt_idx, null, &module_compiler);
                 try module_compiler.base.emit(.pop);
-            },
-            else => {
-                log.err("Unexpected top-level statement: {any}", .{std.meta.activeTag(stmt_node.data)});
-                return Error.AstInvalid;
             },
         }
     }
@@ -912,6 +1173,7 @@ fn compileModule(
         .code = try module_compiler.base.code.toOwnedSlice(gc),
         .constants = try module_compiler.base.constants.toOwnedSlice(gc),
         .global_names = try module_compiler.global_names.toOwnedSlice(gc),
+        .kw_names = try module_compiler.base.kw_names.toOwnedSlice(gc),
         .source = source,
         .source_locs = try module_compiler.base.source_locs.toOwnedSlice(gc),
     };
@@ -975,7 +1237,7 @@ test compile {
     try std.testing.expectEqual(Instruction{ .store_global = @enumFromInt(1) }, module.code[3]);
 
     // Check function code
-    try std.testing.expectEqual(5, func_const.code.len);
+    try std.testing.expectEqual(4, func_const.code.len);
     try std.testing.expectEqual(Instruction{ .load_const = @enumFromInt(0) }, func_const.code[0]);
     try std.testing.expectEqual(Instruction{ .store = @enumFromInt(0) }, func_const.code[1]);
     try std.testing.expectEqual(Instruction{ .load = @enumFromInt(0) }, func_const.code[2]);

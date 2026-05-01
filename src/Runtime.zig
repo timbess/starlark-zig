@@ -25,10 +25,25 @@ current_filename: ?[]const u8 = null,
 /// Optional diagnostic to populate on error
 diagnostic: ?*Diagnostic = null,
 
+/// Structured descriptor handed to a native function on invocation. Carries
+/// positional args plus (optional) kwargs so kwarg-aware natives can read both
+/// without reaching back into the runtime.
+pub const NativeCall = struct {
+    args: []const *StarObj,
+    kwargs: []const KwArg = &.{},
+
+    pub const KwArg = struct {
+        name: []const u8,
+        value: *StarObj,
+    };
+};
+
 const knobs = struct {
     const locals_capacity: usize = 64;
     const frames_capacity: usize = 4096;
 };
+
+pub const locals_capacity = knobs.locals_capacity;
 
 pub const dunder = struct {
     pub const eq = "__eq__";
@@ -40,6 +55,11 @@ pub const dunder = struct {
     pub const le = "__le__";
     pub const gt = "__gt__";
     pub const ge = "__ge__";
+    pub const mod = "__mod__";
+    pub const div = "__truediv__";
+    pub const floor_div = "__floordiv__";
+    pub const bit_or = "__or__";
+    pub const contains = "__contains__";
     pub const iter = "__iter__";
     pub const next = "__next__";
     pub const str = "__str__";
@@ -58,10 +78,11 @@ pub const LocalIdx = enum(u32) { _ };
 pub const ConstIdx = enum(u32) { _ };
 pub const NameIdx = enum(u32) { _ };
 pub const FreeVarIdx = enum(u32) { _ };
+pub const KwNamesIdx = enum(u32) { _ };
 
 pub const Arity = u32;
 
-pub const BinOp = enum { add, sub, mul, eq, ne, lt, le, gt, ge };
+pub const BinOp = enum { add, sub, mul, div, floor_div, bit_or, eq, ne, lt, le, gt, ge, mod, contains };
 
 pub const Instruction = union(enum) {
     load: LocalIdx,
@@ -73,13 +94,28 @@ pub const Instruction = union(enum) {
     binary_op: BinOp,
     bool_not: void,
     call: Arity,
+    /// Call with keyword arguments. The stack layout at dispatch is
+    /// `[..., func, pos_0..pos_{N-1}, kw_0..kw_{M-1}]` where `N == pos_arity`
+    /// and `M == kw_count`. The kwarg names live in the active function's
+    /// `kw_names` pool at indices `[kw_names_start .. kw_names_start + kw_count]`,
+    /// each paired with the kwarg value at the corresponding stack slot.
+    call_kw: struct { pos_arity: Arity, kw_names_start: KwNamesIdx, kw_count: Arity },
     ret: void,
     ret_none: void,
-    make_closure: ConstIdx,
+    /// Materialize a function instance from the prototype constant at
+    /// `const_idx`. Pops `num_defaults` values from the stack (the leftmost
+    /// default was pushed first) and binds them to the rightmost parameters.
+    /// Free variables, if any, are captured from the enclosing frame.
+    make_function: struct {
+        const_idx: ConstIdx,
+        num_defaults: u16,
+    },
     /// Slice of the identifier from the original source code.
     get_attr: []const u8,
     /// Create a list from top N stack elements.
     build_list: u32,
+    /// Create a tuple from top N stack elements.
+    build_tuple: u32,
     /// Create a dict from top N key-value pairs (2*N elements on stack).
     build_dict: u32,
     /// Index into object: pops index, pops object, pushes result.
@@ -98,6 +134,10 @@ pub const Instruction = union(enum) {
     pop_iter: void,
     /// Pop top of stack.
     pop: void,
+    /// Short-circuit AND: if TOS is falsy, jump (keep value); else pop and continue.
+    and_jump: i32,
+    /// Short-circuit OR: if TOS is truthy, jump (keep value); else pop and continue.
+    or_jump: i32,
 
     const Tag = std.meta.Tag(@This());
 };
@@ -120,6 +160,7 @@ pub const RuntimeError = error{
     FrameNoReturn,
     /// For now there is a static number of locals stored in a frame.
     FrameOversized,
+    StarlarkStackOverflow,
     ReturnedOutsideFunction,
     AttributeMissing,
     GlobalUndefined,
@@ -323,13 +364,18 @@ pub const Frame = struct {
 const Runtime = @This();
 
 pub fn init(gpa: Allocator, opts: InitOpts) !Runtime {
-    // TODO: This isn't super ideal given that multiple Runtimes will share these globals.
-    //       The options are:
-    //          1. Attach them to the runtime and pass it around _everywhere_.
-    //          2. Make them thread local and only allow a Runtime per thread.
-    try StarNone.initAttributes(opts.gc);
-    try StarBool.initAttributes(opts.gc);
-    try StarStopIteration.initAttributes(opts.gc);
+    // The singletons (`StarNone.instance`, `StarBool` true/false,
+    // `StarStopIteration.instance`) are process-static, so their attribute
+    // hash maps cannot be allocated from a per-Runtime allocator without
+    // leaving dangling metadata when this Runtime is deinit'd. Each
+    // `initAttributes` self-manages its allocator (page_allocator) and is
+    // idempotent across Runtimes — see the doc comments on each.
+    // TODO: A cleaner long-term shape is to either (a) make the singletons
+    // per-Runtime, or (b) factor a one-shot process-init phase, so that
+    // Runtime.init can avoid touching them at all.
+    try StarNone.initAttributes();
+    try StarBool.initAttributes();
+    try StarStopIteration.initAttributes();
 
     return Runtime{
         .gpa = gpa,
@@ -348,14 +394,22 @@ pub fn deinit(self: *Runtime) void {
     self.globals.deinit(self.gc);
 }
 
-/// Create and push a new frame for `func`. Copies args into locals[0..arity).
-/// ret_addr is the caller's next-pc (an index into the caller's code).
-fn callFn(self: *Runtime, func: *StarFunc, args: []*StarObj) Error!void {
-    if (args.len != func.arity) return RuntimeError.ArityMismatch;
+/// Create and push a new frame for `func`. Copies `args` into locals; missing
+/// arguments are filled from `func.defaults`. `sp_base` is the stack height
+/// the frame will be unwound to on return — callers must shrink the value
+/// stack to that height before invoking `callFn` (i.e. `args` must already
+/// have been removed from the stack and copied into a caller-owned buffer).
+pub fn callFn(self: *Runtime, func: *StarFunc, args: []*StarObj, sp_base: usize) Error!void {
+    if (self.frames.items.len >= knobs.frames_capacity) return RuntimeError.StarlarkStackOverflow;
+    // When there are no defaults, every parameter is required — derive that
+    // here so callers don't have to set both `arity` and `num_required`.
+    const required = if (func.defaults.len == 0) func.arity else func.num_required;
+    if (args.len < required or args.len > func.arity) return RuntimeError.ArityMismatch;
     std.debug.assert(func.frame_size >= func.arity);
+    std.debug.assert(self.stack.items.len == sp_base);
 
     if (comptime std.log.logEnabled(.debug, scope)) {
-        log.debug("callFn: arity={d}, args=[", .{func.arity});
+        log.debug("callFn: arity={d}, sp_base={d}, args=[", .{ func.arity, sp_base });
         for (args, 0..) |arg, i| {
             if (i > 0) log.debug(", ", .{});
             log.debug("{s}", .{arg.vtable.name});
@@ -363,16 +417,26 @@ fn callFn(self: *Runtime, func: *StarFunc, args: []*StarObj) Error!void {
         log.debug("]", .{});
     }
 
-    const sp_base = self.stack.items.len;
-    log.debug("sp_base: {d}", .{sp_base});
+    // Pad with defaults if positional args don't cover the full arity.
+    var defaults_buf: [knobs.locals_capacity]*StarObj = undefined;
+    var call_args: []*StarObj = args;
+    if (args.len < func.arity) {
+        if (func.arity > defaults_buf.len) return RuntimeError.FrameOversized;
+        @memcpy(defaults_buf[0..args.len], args);
+        for (args.len..func.arity) |i| {
+            const default_idx = i - func.num_required;
+            std.debug.assert(default_idx < func.defaults.len);
+            defaults_buf[i] = func.defaults[default_idx];
+        }
+        call_args = defaults_buf[0..func.arity];
+    }
 
     var frame: Frame = undefined;
-    try frame.init(func, sp_base, args);
-
+    try frame.init(func, sp_base, call_args);
     try self.frames.append(self.frame_alloc, frame);
 }
 
-fn stackPop(self: *Runtime) Error!*StarObj {
+pub fn stackPop(self: *Runtime) Error!*StarObj {
     return self.stack.pop() orelse return Error.StackUnderflow;
 }
 
@@ -395,6 +459,32 @@ fn loadGlobal(self: *Runtime, name_idx: GlobalIdx) Error!*StarObj {
     const name = frame.func.names_global[@intFromEnum(name_idx)];
     log.debug("Loading global: {s}", .{name});
     return self.globals.get(name) orelse return RuntimeError.GlobalUndefined;
+}
+
+/// Resolve each name in `names_free` against the enclosing `frame` (its
+/// locals first, then its captured free variables) and return the resulting
+/// closure cells. The frame's compiler is responsible for ensuring every
+/// name resolves; an unresolved name indicates a compiler bug.
+fn captureClosure(gc: Allocator, frame: *Frame, names_free: []const []const u8) Error![]const *StarObj {
+    if (names_free.len == 0) return &.{};
+    const cells = try gc.alloc(*StarObj, names_free.len);
+    // TODO: Consider finding an efficient way to only pay this cost once per function prototype.
+    outer: for (names_free, cells) |name, *cell| {
+        for (frame.func.names_local, 0..) |local_name, local_idx| {
+            if (std.mem.eql(u8, name, local_name)) {
+                cell.* = try frame.readLocal(@enumFromInt(local_idx));
+                continue :outer;
+            }
+        }
+        for (frame.func.names_free, 0..) |free_name, free_idx| {
+            if (std.mem.eql(u8, name, free_name)) {
+                cell.* = try frame.readFree(@enumFromInt(free_idx));
+                continue :outer;
+            }
+        }
+        return RuntimeError.GlobalUndefined;
+    }
+    return cells;
 }
 
 /// Populate diagnostic with stack trace if required.
@@ -432,7 +522,12 @@ fn fillDiagnostic(self: *Runtime, err: Error) void {
 
 /// Step until frame stack is empty, filling in diagnostics in case of error.
 pub fn stepUntilDone(self: *Runtime) Error!void {
-    while (self.frames.items.len > 0) {
+    return self.stepUntilDepth(0);
+}
+
+/// Step until frame stack reaches the given depth (used for recursive execModule calls).
+pub fn stepUntilDepth(self: *Runtime, target_depth: usize) Error!void {
+    while (self.frames.items.len > target_depth) {
         self.step() catch |err| {
             self.fillDiagnostic(err);
             return err;
@@ -478,17 +573,18 @@ fn step(self: *Runtime) Error!void {
             try self.storeGlobal(idx, val);
         },
         .binary_op => |op| {
-            const rhs = try self.stackPop();
-            const lhs = try self.stackPop();
+            // Stack layout (set by the compiler): `[..., self, arg]`.
+            // For `__contains__` the compiler pushes `haystack` then `needle`,
+            // so the dispatch is uniform: `self.<dunder>(arg)`.
+            const arg = try self.stackPop();
+            const self_obj = try self.stackPop();
 
-            // Sorta nice that it enforces that the dunder struct must match the op name.
             const dunder_op = switch (op) {
                 inline else => |o| @field(std.meta.DeclEnum(dunder), @tagName(o)),
             };
 
-            const bound_method = try lhs.getMethodDunder(dunder_op) orelse return Error.AddOpUndefined;
-            const result = try bound_method.call(self.gc, &.{rhs});
-
+            const bound_method = try self_obj.getMethodDunder(dunder_op) orelse return Error.AddOpUndefined;
+            const result = try bound_method.call(self.gc, &.{arg});
             try self.stackPush(result);
         },
         .get_attr => |attr| {
@@ -497,30 +593,35 @@ fn step(self: *Runtime) Error!void {
             try self.stackPush(val);
         },
         .call => |arity_u| {
-            const arity = @as(usize, arity_u);
-
+            const arity: usize = arity_u;
             const sp = self.stack.items.len;
             if (sp < arity + 1) return RuntimeError.StackUnderflow;
 
-            // layout: [..., func_obj, arg1, arg2, ... argN]
-            const args_start = sp - arity;
-            const func_index = args_start - 1;
+            // Stack layout: [..., func_obj, arg1, ..., argN]
+            const func_index = sp - arity - 1;
             const func_obj = self.stack.items[func_index];
-            log.debug("=== Calling function, arity={d}, type={s} ===", .{ arity, func_obj.vtable.name });
+            const args_slice = self.stack.items[func_index + 1 .. sp];
 
-            const args_slice: []*StarObj = self.stack.items[args_start .. args_start + arity];
-
-            // Try interpreted function first: downCast StarFunc
-            const maybe_func: ?*StarFunc = downCast(StarFunc, func_obj) catch |e| switch (e) {
-                TypeError.TypeMismatch => null,
-            };
-
+            const maybe_func: ?*StarFunc = downCast(StarFunc, func_obj) catch null;
             if (maybe_func) |fptr| {
                 if (fptr.native_fn) |f| {
-                    const result = try f(self, args_slice);
+                    const result = try f(self, .{ .args = args_slice });
                     self.stack.shrinkRetainingCapacity(func_index);
                     try self.stackPush(result);
-                } else try self.callFn(fptr, args_slice);
+                } else {
+                    // Copy args off the stack so we can shrink to the clean
+                    // base before recursing into callFn (which expects the
+                    // stack to already be at sp_base).
+                    var args_buf: [knobs.locals_capacity]*StarObj = undefined;
+                    if (arity > args_buf.len) return RuntimeError.FrameOversized;
+                    @memcpy(args_buf[0..arity], args_slice);
+                    self.stack.shrinkRetainingCapacity(func_index);
+                    // callFn may reallocate self.frames, invalidating `frame`,
+                    // so we cannot rely on the post-switch `frame.pc += 1`.
+                    frame.pc += 1;
+                    try self.callFn(fptr, args_buf[0..arity], func_index);
+                    return;
+                }
             } else if (downCast(StarBoundMethod, func_obj)) |bm| {
                 const result = try bm.call(self.gc, args_slice);
                 self.stack.shrinkRetainingCapacity(func_index);
@@ -529,69 +630,99 @@ fn step(self: *Runtime) Error!void {
                 return RuntimeError.CallUndefined;
             }
         },
-        .make_closure => |cidx| {
-            log.debug("=== make_closure called, cidx={d}, frame.func.arity={d}, frame.func.names_local.len={d} ===", .{ @intFromEnum(cidx), frame.func.arity, frame.func.names_local.len });
-            for (frame.func.names_local, 0..) |name, idx| {
-                const val = try frame.readLocal(@enumFromInt(idx));
-                log.debug("  local[{d}] '{s}' = {s}", .{ idx, name, val.vtable.name });
-            }
-            // Get the base function from constants
-            const const_obj = try frame.readConst(cidx);
-            const base_func = try downCast(StarFunc, const_obj);
+        .call_kw => |kw| {
+            const total_args = kw.pos_arity + kw.kw_count;
+            const sp = self.stack.items.len;
+            if (sp < total_args + 1) return RuntimeError.StackUnderflow;
 
-            // Doesn't enclose over free variables.
-            if (base_func.names_free.len == 0) {
-                try self.stackPush(const_obj);
-                return;
-            }
+            const args_start = sp - total_args;
+            const func_index = args_start - 1;
+            const func_obj = self.stack.items[func_index];
 
-            // Allocate closure_cells array
-            const closure_cells = try self.gc.alloc(*StarObj, base_func.names_free.len);
+            const fptr = downCast(StarFunc, func_obj) catch return RuntimeError.CallUndefined;
 
-            // Populate closure_cells by looking up each free variable name in current scope
-            for (base_func.names_free, 0..) |name, i| {
-                var found = false;
+            const kw_names_start: u32 = @intFromEnum(kw.kw_names_start);
+            const kw_names_end = kw_names_start + kw.kw_count;
+            if (kw_names_end > frame.func.kw_names.len) return RuntimeError.ConstOutOfRange;
+            const kw_names = frame.func.kw_names[kw_names_start..kw_names_end];
 
-                for (frame.func.names_local, 0..) |local_name, local_idx| {
-                    if (std.mem.eql(u8, name, local_name)) {
-                        const captured = try frame.readLocal(@enumFromInt(local_idx));
-                        log.debug("Capturing '{s}' from local[{d}], type: {s}", .{ name, local_idx, captured.vtable.name });
-                        closure_cells[i] = captured;
-                        found = true;
-                        break;
+            if (fptr.native_fn) |f| {
+                const pos_args = self.stack.items[args_start .. args_start + kw.pos_arity];
+                const kw_values = self.stack.items[args_start + kw.pos_arity .. sp];
+                var kwarg_buf: [knobs.locals_capacity]NativeCall.KwArg = undefined;
+                if (kw.kw_count > kwarg_buf.len) return RuntimeError.FrameOversized;
+                for (kw_names, kw_values, 0..) |name, value, i| {
+                    kwarg_buf[i] = .{ .name = name, .value = value };
+                }
+                const result = try f(self, .{
+                    .args = pos_args,
+                    .kwargs = kwarg_buf[0..kw.kw_count],
+                });
+                self.stack.shrinkRetainingCapacity(func_index);
+                try self.stackPush(result);
+            } else {
+                // Interpreted function: bind args to declared parameters.
+                const pos_args = self.stack.items[args_start .. args_start + kw.pos_arity];
+                const kw_values = self.stack.items[args_start + kw.pos_arity .. sp];
+                var bound_buf: [knobs.locals_capacity]*StarObj = undefined;
+                if (fptr.arity > bound_buf.len) return RuntimeError.FrameOversized;
+                const bound = bound_buf[0..fptr.arity];
+
+                // Fill from positional args, then defaults, then overlay kwargs.
+                for (bound, 0..) |*slot, i| {
+                    if (i < pos_args.len) {
+                        slot.* = pos_args[i];
+                    } else if (i >= fptr.num_required and i - fptr.num_required < fptr.defaults.len) {
+                        slot.* = fptr.defaults[i - fptr.num_required];
+                    } else {
+                        slot.* = StarNone.instance; // unbound; expected to be filled by a kwarg below
                     }
                 }
-
-                if (!found) {
-                    for (frame.func.names_free, 0..) |free_name, free_idx| {
-                        if (std.mem.eql(u8, name, free_name)) {
-                            closure_cells[i] = try frame.readFree(@enumFromInt(free_idx));
-                            found = true;
+                for (kw_names, kw_values) |name, value| {
+                    for (fptr.names_local[0..fptr.arity], 0..) |param, i| {
+                        if (std.mem.eql(u8, param, name)) {
+                            bound[i] = value;
                             break;
                         }
                     }
                 }
-
-                if (!found) {
-                    return RuntimeError.GlobalUndefined; // Should never happen if compiler is correct
-                }
+                self.stack.shrinkRetainingCapacity(func_index);
+                // See comment in `.call` arm: advance our PC before the
+                // callee's frame is pushed.
+                frame.pc += 1;
+                try self.callFn(fptr, bound, func_index);
+                return;
             }
+        },
+        .make_function => |mf| {
+            const proto_obj = try frame.readConst(mf.const_idx);
+            const proto = try downCast(StarFunc, proto_obj);
 
-            // Create new function with captured cells
-            const closure_func = try self.gc.create(StarFunc);
-            closure_func.* = .{
-                .code = base_func.code,
-                .consts = base_func.consts,
-                .arity = base_func.arity,
-                .frame_size = base_func.frame_size,
-                .names_local = base_func.names_local,
-                .names_free = base_func.names_free,
-                .closure_cells = closure_cells,
-                .name = base_func.name,
-                .source_locs = base_func.source_locs,
-            };
+            // Pop default values (last pushed = last param to receive a default).
+            // We hand them to the new function in declaration order.
+            const sp = self.stack.items.len;
+            if (sp < mf.num_defaults) return RuntimeError.StackUnderflow;
+            const defaults_start = sp - mf.num_defaults;
 
-            try self.stackPush(&closure_func.obj);
+            // Fast path: no defaults and no free vars → reuse the prototype.
+            if (mf.num_defaults == 0 and proto.names_free.len == 0) {
+                try self.stackPush(proto_obj);
+            } else {
+                const defaults: []const *StarObj = if (mf.num_defaults == 0)
+                    &.{}
+                else
+                    try self.gc.dupe(*StarObj, self.stack.items[defaults_start..sp]);
+                self.stack.shrinkRetainingCapacity(defaults_start);
+
+                const closure_cells = try captureClosure(self.gc, frame, proto.names_free);
+
+                const new_func = try self.gc.create(StarFunc);
+                new_func.* = proto.*;
+                try new_func.obj.cloneFrom(self.gc, &proto.obj);
+                new_func.defaults = defaults;
+                new_func.closure_cells = closure_cells;
+                try self.stackPush(&new_func.obj);
+            }
         },
         .bool_not => {
             const val = try self.stackPop();
@@ -605,6 +736,15 @@ fn step(self: *Runtime) Error!void {
             const list = try StarList.init(self.gc, elements);
             self.stack.shrinkRetainingCapacity(start);
             try self.stackPush(&list.obj);
+        },
+        .build_tuple => |count| {
+            const sp = self.stack.items.len;
+            if (sp < count) return RuntimeError.StackUnderflow;
+            const start = sp - count;
+            const elements = self.stack.items[start..sp];
+            const tuple = try StarTuple.init(self.gc, elements);
+            self.stack.shrinkRetainingCapacity(start);
+            try self.stackPush(&tuple.obj);
         },
         .build_dict => |count| {
             const sp = self.stack.items.len;
@@ -620,9 +760,13 @@ fn step(self: *Runtime) Error!void {
             const idx_obj = try self.stackPop();
             const obj = try self.stackPop();
 
-            const list = downCast(StarList, obj) catch return TypeError.TypeMismatch;
             const idx_int = try downCast(StarInt, idx_obj);
-            const val = try list.getItem(@intCast(idx_int.num));
+            const val = if (downCast(StarList, obj)) |list|
+                try list.getItem(@intCast(idx_int.num))
+            else |_| if (downCast(StarTuple, obj)) |tuple|
+                try tuple.getItem(@intCast(idx_int.num))
+            else |_|
+                return TypeError.TypeMismatch;
             try self.stackPush(val);
         },
         .jump => |offset| {
@@ -670,20 +814,44 @@ fn step(self: *Runtime) Error!void {
         .pop => {
             _ = try self.stackPop();
         },
+        .and_jump => |offset| {
+            const val = self.stack.items[self.stack.items.len - 1];
+            if (!val.isTruthy()) {
+                // Falsy: short-circuit, keep value on stack, jump
+                const new_pc: i64 = @as(i64, @intCast(frame.pc)) + 1 + offset;
+                frame.pc = @intCast(new_pc);
+                return;
+            } else {
+                // Truthy: pop and evaluate RHS
+                _ = try self.stackPop();
+            }
+        },
+        .or_jump => |offset| {
+            const val = self.stack.items[self.stack.items.len - 1];
+            if (val.isTruthy()) {
+                // Truthy: short-circuit, keep value on stack, jump
+                const new_pc: i64 = @as(i64, @intCast(frame.pc)) + 1 + offset;
+                frame.pc = @intCast(new_pc);
+                return;
+            } else {
+                // Falsy: pop and evaluate RHS
+                _ = try self.stackPop();
+            }
+        },
         .ret, .ret_none => {
             const frame_val = self.frames.pop() orelse return error.ReturnedOutsideFunction;
             const return_value =
                 if (std.meta.activeTag(instr) == .ret) try self.stackPop() else StarNone.instance;
             log.debug("ret: returning {s}", .{return_value.vtable.name});
-            // Pop args, and function reference.
-            const new_sp = frame_val.sp_base - frame_val.func.arity - 1;
-            std.debug.assert(new_sp >= 0);
-            self.stack.shrinkRetainingCapacity(new_sp);
+            // sp_base is the clean stack height established by the caller
+            // before the call instruction ran (see callFn). Restoring to it
+            // discards any operands the callee pushed but didn't consume.
+            self.stack.shrinkRetainingCapacity(frame_val.sp_base);
             try self.stackPush(return_value);
             return; // Don't increment PC after ret
         },
     }
-    frame.pc += 1;
+    self.frames.items[self.frames.items.len - 1].pc += 1;
 }
 
 /// Inefficient and not ideal. Should only be used when the scope where a variable lives
@@ -724,9 +892,11 @@ pub fn execModule(self: *Runtime, module: *const Compiler.Module) Error!void {
     self.current_filename = module.module_name;
 
     std.debug.assert(mod.init_fn.arity == 0);
-    try self.stackPush(&mod.init_fn.obj);
-    try self.callFn(&mod.init_fn, &.{});
-    try self.stepUntilDone();
+    const initial_depth = self.frames.items.len;
+    const sp_base = self.stack.items.len;
+    try self.callFn(&mod.init_fn, &.{}, sp_base);
+    try self.stepUntilDepth(initial_depth);
+    // The frame's `ret` left the return value (None) on top — discard it.
     _ = try self.stackPop();
 }
 
@@ -735,23 +905,69 @@ pub const StarInt = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
+            .type_name = "int",
+            .setup_attrs = &setupAttrs,
         },
     },
 
     pub fn init(allocator: Allocator, num: i64) !*StarInt {
         const self = try allocator.create(StarInt);
         self.* = .{ .num = num };
-        try self.obj.attributes.put(allocator, dunder.add, &(try StarBoundMethod.init(allocator, &self.obj, &add)).obj);
-        try self.obj.attributes.put(allocator, dunder.sub, &(try StarBoundMethod.init(allocator, &self.obj, &sub)).obj);
-        try self.obj.attributes.put(allocator, dunder.mul, &(try StarBoundMethod.init(allocator, &self.obj, &mul)).obj);
-        try self.obj.attributes.put(allocator, dunder.eq, &(try StarBoundMethod.init(allocator, &self.obj, &eqFn)).obj);
-        try self.obj.attributes.put(allocator, dunder.ne, &(try StarBoundMethod.init(allocator, &self.obj, &neFn)).obj);
-        try self.obj.attributes.put(allocator, dunder.lt, &(try StarBoundMethod.init(allocator, &self.obj, &ltFn)).obj);
-        try self.obj.attributes.put(allocator, dunder.le, &(try StarBoundMethod.init(allocator, &self.obj, &leFn)).obj);
-        try self.obj.attributes.put(allocator, dunder.gt, &(try StarBoundMethod.init(allocator, &self.obj, &gtFn)).obj);
-        try self.obj.attributes.put(allocator, dunder.ge, &(try StarBoundMethod.init(allocator, &self.obj, &geFn)).obj);
-        try self.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &self.obj, &strFn)).obj);
+        try setupAttrs(allocator, &self.obj);
         return self;
+    }
+
+    fn setupAttrs(allocator: Allocator, obj: *StarObj) Allocator.Error!void {
+        try obj.attributes.put(allocator, dunder.add, &(try StarBoundMethod.init(allocator, obj, &add)).obj);
+        try obj.attributes.put(allocator, dunder.sub, &(try StarBoundMethod.init(allocator, obj, &sub)).obj);
+        try obj.attributes.put(allocator, dunder.mul, &(try StarBoundMethod.init(allocator, obj, &mul)).obj);
+        try obj.attributes.put(allocator, dunder.eq, &(try StarBoundMethod.init(allocator, obj, &eqFn)).obj);
+        try obj.attributes.put(allocator, dunder.ne, &(try StarBoundMethod.init(allocator, obj, &neFn)).obj);
+        try obj.attributes.put(allocator, dunder.lt, &(try StarBoundMethod.init(allocator, obj, &ltFn)).obj);
+        try obj.attributes.put(allocator, dunder.le, &(try StarBoundMethod.init(allocator, obj, &leFn)).obj);
+        try obj.attributes.put(allocator, dunder.gt, &(try StarBoundMethod.init(allocator, obj, &gtFn)).obj);
+        try obj.attributes.put(allocator, dunder.ge, &(try StarBoundMethod.init(allocator, obj, &geFn)).obj);
+        try obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, obj, &strFn)).obj);
+        try obj.attributes.put(allocator, dunder.mod, &(try StarBoundMethod.init(allocator, obj, &modFn)).obj);
+        try obj.attributes.put(allocator, dunder.div, &(try StarBoundMethod.init(allocator, obj, &divFn)).obj);
+        try obj.attributes.put(allocator, dunder.floor_div, &(try StarBoundMethod.init(allocator, obj, &floorDivFn)).obj);
+        try obj.attributes.put(allocator, dunder.bit_or, &(try StarBoundMethod.init(allocator, obj, &bitOrFn)).obj);
+    }
+
+    fn modFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarInt = @fieldParentPtr("obj", self_obj);
+        const other = try downCast(StarInt, args[0]);
+        if (other.num == 0) return Error.TypeMismatch; // division by zero
+        // Python-style modulo: result has sign of divisor
+        const result = try StarInt.init(allocator, @mod(self.num, other.num));
+        return &result.obj;
+    }
+
+    fn divFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarInt = @fieldParentPtr("obj", self_obj);
+        const other = try downCast(StarInt, args[0]);
+        if (other.num == 0) return Error.TypeMismatch;
+        const result = try StarFloat.init(allocator, @as(f64, @floatFromInt(self.num)) / @as(f64, @floatFromInt(other.num)));
+        return &result.obj;
+    }
+
+    fn floorDivFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarInt = @fieldParentPtr("obj", self_obj);
+        const other = try downCast(StarInt, args[0]);
+        if (other.num == 0) return Error.TypeMismatch;
+        const result = try StarInt.init(allocator, @divFloor(self.num, other.num));
+        return &result.obj;
+    }
+
+    fn bitOrFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarInt = @fieldParentPtr("obj", self_obj);
+        const other = try downCast(StarInt, args[0]);
+        const result = try StarInt.init(allocator, self.num | other.num);
+        return &result.obj;
     }
 
     fn add(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
@@ -834,17 +1050,43 @@ pub const StarFloat = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
+            .type_name = "float",
+            .setup_attrs = &setupAttrs,
         },
     },
 
     pub fn init(allocator: Allocator, num: f64) !*StarFloat {
         const self = try allocator.create(StarFloat);
         self.* = .{ .num = num };
-        try self.obj.attributes.put(allocator, dunder.add, &(try StarBoundMethod.init(allocator, &self.obj, &add)).obj);
-        try self.obj.attributes.put(allocator, dunder.sub, &(try StarBoundMethod.init(allocator, &self.obj, &sub)).obj);
-        try self.obj.attributes.put(allocator, dunder.mul, &(try StarBoundMethod.init(allocator, &self.obj, &mul)).obj);
-        try self.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &self.obj, &strFn)).obj);
+        try setupAttrs(allocator, &self.obj);
         return self;
+    }
+
+    fn setupAttrs(allocator: Allocator, obj: *StarObj) Allocator.Error!void {
+        try obj.attributes.put(allocator, dunder.add, &(try StarBoundMethod.init(allocator, obj, &add)).obj);
+        try obj.attributes.put(allocator, dunder.sub, &(try StarBoundMethod.init(allocator, obj, &sub)).obj);
+        try obj.attributes.put(allocator, dunder.mul, &(try StarBoundMethod.init(allocator, obj, &mul)).obj);
+        try obj.attributes.put(allocator, dunder.div, &(try StarBoundMethod.init(allocator, obj, &divFn)).obj);
+        try obj.attributes.put(allocator, dunder.floor_div, &(try StarBoundMethod.init(allocator, obj, &floorDivFn)).obj);
+        try obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, obj, &strFn)).obj);
+    }
+
+    fn divFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarFloat = @fieldParentPtr("obj", self_obj);
+        const other = try downCast(StarFloat, args[0]);
+        if (other.num == 0.0) return Error.TypeMismatch;
+        const result = try StarFloat.init(allocator, self.num / other.num);
+        return &result.obj;
+    }
+
+    fn floorDivFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarFloat = @fieldParentPtr("obj", self_obj);
+        const other = try downCast(StarFloat, args[0]);
+        if (other.num == 0.0) return Error.TypeMismatch;
+        const result = try StarFloat.init(allocator, @floor(self.num / other.num));
+        return &result.obj;
     }
 
     fn add(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
@@ -885,15 +1127,25 @@ pub const StarStr = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
+            .type_name = "string",
+            .setup_attrs = &setupAttrs,
         },
     },
 
     pub fn init(allocator: Allocator, s: []const u8) !*StarStr {
         const self = try allocator.create(StarStr);
         self.* = .{ .str = s };
-        try self.obj.attributes.put(allocator, "upper", &(try StarBoundMethod.init(allocator, &self.obj, &upper)).obj);
-        try self.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &self.obj, &strFn)).obj);
+        try setupAttrs(allocator, &self.obj);
         return self;
+    }
+
+    fn setupAttrs(allocator: Allocator, obj: *StarObj) Allocator.Error!void {
+        try obj.attributes.put(allocator, "upper", &(try StarBoundMethod.init(allocator, obj, &upper)).obj);
+        try obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, obj, &strFn)).obj);
+        try obj.attributes.put(allocator, dunder.eq, &(try StarBoundMethod.init(allocator, obj, &eqFn)).obj);
+        try obj.attributes.put(allocator, dunder.ne, &(try StarBoundMethod.init(allocator, obj, &neFn)).obj);
+        try obj.attributes.put(allocator, dunder.mod, &(try StarBoundMethod.init(allocator, obj, &modFn)).obj);
+        try obj.attributes.put(allocator, dunder.contains, &(try StarBoundMethod.init(allocator, obj, &containsFn)).obj);
     }
 
     pub fn init_dupe(allocator: Allocator, s: []const u8) !*StarStr {
@@ -909,6 +1161,103 @@ pub const StarStr = struct {
         }
         const new = try StarStr.init(allocator, upper_str);
         return &new.obj;
+    }
+
+    fn modFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarStr = @fieldParentPtr("obj", self_obj);
+        // String formatting: "format %s %d" % args
+        // args can be a single value or a tuple/list of values
+        var fmt_args: []const *StarObj = undefined;
+        if (downCast(StarTuple, args[0])) |tuple| {
+            fmt_args = tuple.items;
+        } else |_| if (downCast(StarList, args[0])) |list| {
+            fmt_args = list.items.items;
+        } else |_| {
+            // Single value — treat as a 1-element tuple
+            fmt_args = args[0..1];
+        }
+
+        var buf = std.ArrayList(u8).empty;
+        var arg_idx: usize = 0;
+        var i: usize = 0;
+        while (i < self.str.len) {
+            if (self.str[i] == '%' and i + 1 < self.str.len) {
+                const spec = self.str[i + 1];
+                switch (spec) {
+                    's' => {
+                        if (arg_idx < fmt_args.len) {
+                            if (try fmt_args[arg_idx].getMethodDunder(.str)) |m| {
+                                const s = try m.call(allocator, &.{});
+                                const sv = try downCast(StarStr, s);
+                                try buf.appendSlice(allocator, sv.str);
+                            }
+                            arg_idx += 1;
+                        }
+                        i += 2;
+                    },
+                    'd', 'i' => {
+                        if (arg_idx < fmt_args.len) {
+                            if (downCast(StarInt, fmt_args[arg_idx])) |int_val| {
+                                const s = try std.fmt.allocPrint(allocator, "{d}", .{int_val.num});
+                                try buf.appendSlice(allocator, s);
+                            } else |_| {
+                                try buf.appendSlice(allocator, "?");
+                            }
+                            arg_idx += 1;
+                        }
+                        i += 2;
+                    },
+                    'r' => {
+                        if (arg_idx < fmt_args.len) {
+                            if (try fmt_args[arg_idx].getMethodDunder(.str)) |m| {
+                                const s = try m.call(allocator, &.{});
+                                const sv = try downCast(StarStr, s);
+                                try buf.appendSlice(allocator, sv.str);
+                            }
+                            arg_idx += 1;
+                        }
+                        i += 2;
+                    },
+                    '%' => {
+                        try buf.append(allocator, '%');
+                        i += 2;
+                    },
+                    else => {
+                        try buf.append(allocator, '%');
+                        i += 1;
+                    },
+                }
+            } else {
+                try buf.append(allocator, self.str[i]);
+                i += 1;
+            }
+        }
+
+        const result = try StarStr.init(allocator, buf.items);
+        return &result.obj;
+    }
+
+    fn containsFn(_: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarStr = @fieldParentPtr("obj", self_obj);
+        const needle = downCast(StarStr, args[0]) catch return Error.TypeMismatch;
+        const found = std.mem.indexOf(u8, self.str, needle.str) != null;
+        return StarBool.get(found);
+    }
+
+    fn eqFn(_: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarStr = @fieldParentPtr("obj", self_obj);
+        const other = downCast(StarStr, args[0]) catch return StarBool.get(false);
+        return StarBool.get(std.mem.eql(u8, self.str, other.str));
+    }
+
+    fn neFn(_: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarStr = @fieldParentPtr("obj", self_obj);
+        const other = downCast(StarStr, args[0]) catch return StarBool.get(true);
+        return StarBool.get(!std.mem.eql(u8, self.str, other.str));
     }
 
     fn strFn(_: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
@@ -987,6 +1336,7 @@ pub fn unwrapStar(T: type, value: *T) starTypeToZig(T) {
 
 pub const StarFunc = struct {
     code: []const Instruction = &.{},
+
     arity: usize,
     /// number of local slots
     frame_size: usize,
@@ -998,6 +1348,9 @@ pub const StarFunc = struct {
     names_free: []const []const u8 = &.{},
     /// All global var names referenced by this function
     names_global: []const []const u8 = &.{},
+    /// Pool of kwarg names referenced by `call_kw` instructions in this
+    /// function. Each `call_kw` carries `(start, count)` indices into this.
+    kw_names: []const []const u8 = &.{},
     /// Closure cells (captured variables)
     closure_cells: []const *StarObj = &.{},
 
@@ -1006,13 +1359,26 @@ pub const StarFunc = struct {
     /// Source locations parallel to code, maps each instruction to source
     source_locs: []const SourceLoc = &.{},
 
-    native_fn: ?*const fn (rt: *Runtime, args: []const *StarObj) Error!*StarObj = null,
+    /// Default parameter values (right-aligned: defaults[0] is for param at index num_required)
+    defaults: []const *StarObj = &.{},
+    /// Number of required (non-default) parameters
+    num_required: usize = 0,
+
+    native_fn: ?*const fn (rt: *Runtime, call: NativeCall) Error!*StarObj = null,
 
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
+            .type_name = "function",
+            .setup_attrs = &setupAttrs,
         },
     },
+
+    pub const native_type_name: []const u8 = "builtin_function_or_method";
+
+    pub fn setupAttrs(allocator: Allocator, obj: *StarObj) Allocator.Error!void {
+        try obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, obj, &strFn)).obj);
+    }
 
     pub fn strFn(_: Allocator, _: *StarObj, args: []const *StarObj) Error!*StarObj {
         if (args.len != 0) return Error.ArityMismatch;
@@ -1021,54 +1387,82 @@ pub const StarFunc = struct {
 
     var func_str = StarStr{ .str = "<function>" };
 
+    /// Wrap a Zig function as a `StarFunc` whose `native_fn` accepts a
+    /// `NativeCall`. The Args shape determines what the wrapper passes to the
+    /// native:
+    ///   * `NativeCall`         — full call descriptor (positional + kwargs).
+    ///   * `[]const *StarObj`   — variadic positional slice (kwargs dropped).
+    ///   * `struct { ... }`     — fixed-arity, typed: each field is downcast
+    ///                            from the corresponding positional arg.
     pub fn fromNative(
-        // TODO: kwargs
         Args: type,
         comptime native: fn (rt: *Runtime, args: Args) Error!?*StarObj,
     ) StarFunc {
-        // Handle variadic args: []const *StarObj
-        if (Args == []const *StarObj) {
+        // Full call descriptor.
+        if (Args == NativeCall) {
             const native_fn = struct {
-                pub fn wrapper(rt: *Runtime, args: []const *StarObj) Error!*StarObj {
-                    const res = try native(rt, args);
+                pub fn wrapper(rt: *Runtime, call: NativeCall) Error!*StarObj {
+                    const res = try native(rt, call);
                     if (res) |r| return r;
                     return StarNone.instance;
                 }
             }.wrapper;
-            return StarFunc{
-                .native_fn = &native_fn,
-                .arity = 0, // variadic
-                .frame_size = 0,
-            };
+            return native_func(&native_fn, 0, 0);
         }
 
-        const args_typeinfo = @typeInfo(Args);
-        switch (args_typeinfo) {
+        // Variadic positional slice; kwargs are silently dropped.
+        if (Args == []const *StarObj) {
+            const native_fn = struct {
+                pub fn wrapper(rt: *Runtime, call: NativeCall) Error!*StarObj {
+                    const res = try native(rt, call.args);
+                    if (res) |r| return r;
+                    return StarNone.instance;
+                }
+            }.wrapper;
+            return native_func(&native_fn, 0, 0);
+        }
+
+        switch (@typeInfo(Args)) {
             .@"struct" => |s| {
                 const arity = s.fields.len;
                 const native_fn = struct {
-                    pub fn wrapper(rt: *Runtime, args: []const *StarObj) Error!*StarObj {
+                    pub fn wrapper(rt: *Runtime, call: NativeCall) Error!*StarObj {
+                        if (call.kwargs.len != 0 or call.args.len != arity) {
+                            return Error.ArityMismatch;
+                        }
                         var parsed_args: Args = undefined;
-                        if (args.len != arity) return Error.ArityMismatch;
                         inline for (s.fields, 0..) |field, i| {
                             const StarType = comptime zigToStarType(field.type);
-                            const downcasted: *StarType = try downCast(StarType, args[i]);
+                            const downcasted: *StarType = try downCast(StarType, call.args[i]);
                             @field(parsed_args, field.name) = unwrapStar(StarType, downcasted);
                         }
                         const res = try native(rt, parsed_args);
-
                         if (res) |r| return r;
                         return StarNone.instance;
                     }
                 }.wrapper;
-                return StarFunc{
-                    .native_fn = &native_fn,
-                    .arity = arity,
-                    .frame_size = arity,
-                };
+                return native_func(&native_fn, arity, arity);
             },
             else => @compileError("Expected struct but got " ++ @typeName(Args)),
         }
+    }
+
+    fn native_func(
+        native_fn: *const fn (rt: *Runtime, call: NativeCall) Error!*StarObj,
+        arity: usize,
+        frame_size: usize,
+    ) StarFunc {
+        return StarFunc{
+            .native_fn = native_fn,
+            .arity = arity,
+            .frame_size = frame_size,
+            .obj = .{
+                .vtable = .{
+                    .name = @typeName(StarFunc),
+                    .type_name = native_type_name,
+                },
+            },
+        };
     }
 
     test "Native function" {
@@ -1089,6 +1483,7 @@ pub const StarNone = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
+            .type_name = "NoneType",
         },
     },
 
@@ -1097,9 +1492,25 @@ pub const StarNone = struct {
         return &none_str.obj;
     }
 
-    pub fn initAttributes(allocator: Allocator) !void {
+    fn eqFn(_: Allocator, _: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        return StarBool.get(args[0] == instance);
+    }
+
+    fn neFn(_: Allocator, _: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        return StarBool.get(args[0] != instance);
+    }
+
+    /// Initialize the singleton's attributes. Takes no allocator because the
+    /// singleton (`none_obj`) lives for the process lifetime and is shared
+    /// across Runtime instances
+    pub fn initAttributes() !void {
         if (none_obj.obj.attributes.count() > 0) return;
+        const allocator = std.heap.smp_allocator;
         try none_obj.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &none_obj.obj, &strFn)).obj);
+        try none_obj.obj.attributes.put(allocator, dunder.eq, &(try StarBoundMethod.init(allocator, &none_obj.obj, &eqFn)).obj);
+        try none_obj.obj.attributes.put(allocator, dunder.ne, &(try StarBoundMethod.init(allocator, &none_obj.obj, &neFn)).obj);
     }
 
     var none_obj = StarNone{};
@@ -1112,6 +1523,7 @@ pub const StarStopIteration = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
+            .type_name = "stop_iteration",
         },
     },
 
@@ -1120,8 +1532,11 @@ pub const StarStopIteration = struct {
         return &stop_str.obj;
     }
 
-    pub fn initAttributes(allocator: Allocator) !void {
+    /// See `StarNone.initAttributes` for the rationale on the no-allocator
+    /// signature.
+    pub fn initAttributes() !void {
         if (stop_obj.obj.attributes.count() > 0) return;
+        const allocator = std.heap.smp_allocator;
         try stop_obj.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &stop_obj.obj, &strFn)).obj);
     }
 
@@ -1136,6 +1551,7 @@ pub const StarBool = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
+            .type_name = "bool",
         },
     },
 
@@ -1155,8 +1571,11 @@ pub const StarBool = struct {
         if (self.value) return &true_str.obj else return &false_str.obj;
     }
 
-    pub fn initAttributes(allocator: Allocator) !void {
+    /// See `StarNone.initAttributes` for the rationale on the no-allocator
+    /// signature.
+    pub fn initAttributes() !void {
         if (true_obj.obj.attributes.count() > 0) return;
+        const allocator = std.heap.page_allocator;
         try true_obj.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &true_obj.obj, &strFn)).obj);
         try false_obj.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &false_obj.obj, &strFn)).obj);
     }
@@ -1167,11 +1586,34 @@ pub const StarBool = struct {
     var false_str = StarStr{ .str = "False" };
 };
 
+/// Index a sequence with Python-style negative-index semantics.
+fn sequenceGetItem(items: []const *StarObj, idx: i64) Error!*StarObj {
+    const len: i64 = @intCast(items.len);
+    const actual = if (idx < 0) idx + len else idx;
+    if (actual < 0 or actual >= len) return error.IndexOutOfRange;
+    return items[@intCast(actual)];
+}
+
+/// Linear search for `needle`, comparing via `__eq__` (with pointer-equality
+/// fast path). Used by `__contains__` on lists and tuples.
+fn sequenceContains(allocator: Allocator, items: []const *StarObj, needle: *StarObj) Error!*StarObj {
+    for (items) |item| {
+        if (item == needle) return StarBool.get(true);
+        const eq_method = (try item.getMethodDunder(.eq)) orelse continue;
+        const result = try eq_method.call(allocator, &.{needle});
+        const result_bool = downCast(StarBool, result) catch continue;
+        if (result_bool.value) return StarBool.get(true);
+    }
+    return StarBool.get(false);
+}
+
 pub const StarList = struct {
     items: std.ArrayList(*StarObj),
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
+            .type_name = "list",
+            .setup_attrs = &setupAttrs,
         },
     },
 
@@ -1180,18 +1622,25 @@ pub const StarList = struct {
         var list = std.ArrayList(*StarObj).empty;
         try list.appendSlice(allocator, items);
         self.* = .{ .items = list };
-        try self.obj.attributes.put(allocator, "append", &(try StarBoundMethod.init(allocator, &self.obj, &append)).obj);
-        try self.obj.attributes.put(allocator, dunder.iter, &(try StarBoundMethod.init(allocator, &self.obj, &iter)).obj);
-        try self.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &self.obj, &strFn)).obj);
+        try setupAttrs(allocator, &self.obj);
         return self;
     }
 
+    fn setupAttrs(allocator: Allocator, obj: *StarObj) Allocator.Error!void {
+        try obj.attributes.put(allocator, "append", &(try StarBoundMethod.init(allocator, obj, &append)).obj);
+        try obj.attributes.put(allocator, dunder.iter, &(try StarBoundMethod.init(allocator, obj, &iter)).obj);
+        try obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, obj, &strFn)).obj);
+        try obj.attributes.put(allocator, dunder.contains, &(try StarBoundMethod.init(allocator, obj, &containsFn)).obj);
+    }
+
+    fn containsFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarList = @fieldParentPtr("obj", self_obj);
+        return sequenceContains(allocator, self.items.items, args[0]);
+    }
+
     pub fn getItem(self: *StarList, idx: i64) Error!*StarObj {
-        const len: i64 = @intCast(self.items.items.len);
-        var actual_idx = idx;
-        if (actual_idx < 0) actual_idx += len;
-        if (actual_idx < 0 or actual_idx >= len) return error.IndexOutOfRange;
-        return self.items.items[@intCast(actual_idx)];
+        return sequenceGetItem(self.items.items, idx);
     }
 
     fn strFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
@@ -1232,11 +1681,133 @@ pub const StarList = struct {
     }
 };
 
+pub const StarTuple = struct {
+    items: []const *StarObj,
+    obj: StarObj = .{
+        .vtable = StarObj.Vtable{
+            .name = @typeName(@This()),
+            .type_name = "tuple",
+            .setup_attrs = &setupAttrs,
+        },
+    },
+
+    pub fn init(allocator: Allocator, items: []const *StarObj) !*StarTuple {
+        const self = try allocator.create(StarTuple);
+        const owned = try allocator.dupe(*StarObj, items);
+        self.* = .{ .items = owned };
+        try setupAttrs(allocator, &self.obj);
+        return self;
+    }
+
+    fn setupAttrs(allocator: Allocator, obj: *StarObj) Allocator.Error!void {
+        try obj.attributes.put(allocator, dunder.iter, &(try StarBoundMethod.init(allocator, obj, &iterFn)).obj);
+        try obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, obj, &strFn)).obj);
+        try obj.attributes.put(allocator, dunder.eq, &(try StarBoundMethod.init(allocator, obj, &eqFn)).obj);
+        try obj.attributes.put(allocator, dunder.contains, &(try StarBoundMethod.init(allocator, obj, &containsFn)).obj);
+    }
+
+    pub fn getItem(self: *StarTuple, idx: i64) Error!*StarObj {
+        return sequenceGetItem(self.items, idx);
+    }
+
+    fn iterFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
+        const self: *StarTuple = @fieldParentPtr("obj", self_obj);
+        const it = try StarSliceIter.init(allocator, self.items);
+        return &it.obj;
+    }
+
+    fn strFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
+        const self: *StarTuple = @fieldParentPtr("obj", self_obj);
+        var buf = std.ArrayList(u8).empty;
+        try buf.append(allocator, '(');
+        for (self.items, 0..) |item, i| {
+            if (i > 0) try buf.appendSlice(allocator, ", ");
+            if (try item.getMethodDunder(.str)) |str_method| {
+                const str_obj = try str_method.call(allocator, &.{});
+                const str_val = try downCast(StarStr, str_obj);
+                try buf.appendSlice(allocator, str_val.str);
+            } else {
+                try buf.appendSlice(allocator, "<object>");
+            }
+        }
+        if (self.items.len == 1) try buf.append(allocator, ',');
+        try buf.append(allocator, ')');
+        return &(try StarStr.init(allocator, buf.items)).obj;
+    }
+
+    fn eqFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarTuple = @fieldParentPtr("obj", self_obj);
+        const other = downCast(StarTuple, args[0]) catch return StarBool.get(false);
+        if (self.items.len != other.items.len) return StarBool.get(false);
+        for (self.items, other.items) |a, b| {
+            if (a == b) continue;
+            if (try a.getMethodDunder(.eq)) |eq_method| {
+                const result = try eq_method.call(allocator, &.{b});
+                if (downCast(StarBool, result)) |bv| {
+                    if (!bv.value) return StarBool.get(false);
+                } else |_| return StarBool.get(false);
+            } else return StarBool.get(false);
+        }
+        return StarBool.get(true);
+    }
+
+    fn containsFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 1) return Error.ArityMismatch;
+        const self: *StarTuple = @fieldParentPtr("obj", self_obj);
+        return sequenceContains(allocator, self.items, args[0]);
+    }
+};
+
+/// Iterator over an immutable slice of `*StarObj`. Used by tuples (and any
+/// caller that has a stable slice and doesn't need a backing collection).
+pub const StarSliceIter = struct {
+    items: []const *StarObj,
+    index: usize = 0,
+    obj: StarObj = .{
+        .vtable = StarObj.Vtable{
+            .name = @typeName(@This()),
+            .type_name = "tuple_iterator",
+            .setup_attrs = &setupAttrs,
+        },
+    },
+
+    pub fn init(allocator: Allocator, items: []const *StarObj) !*StarSliceIter {
+        const self = try allocator.create(StarSliceIter);
+        self.* = .{ .items = items };
+        try setupAttrs(allocator, &self.obj);
+        return self;
+    }
+
+    fn setupAttrs(allocator: Allocator, obj: *StarObj) Allocator.Error!void {
+        try obj.attributes.put(allocator, dunder.iter, &(try StarBoundMethod.init(allocator, obj, &iterFn)).obj);
+        try obj.attributes.put(allocator, dunder.next, &(try StarBoundMethod.init(allocator, obj, &nextFn)).obj);
+    }
+
+    fn iterFn(_: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
+        return self_obj;
+    }
+
+    fn nextFn(_: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+        if (args.len != 0) return Error.ArityMismatch;
+        const self: *StarSliceIter = @fieldParentPtr("obj", self_obj);
+        if (self.index >= self.items.len) return StarStopIteration.instance;
+        const v = self.items[self.index];
+        self.index += 1;
+        return v;
+    }
+};
+
 pub const StarDict = struct {
     entries: std.AutoArrayHashMapUnmanaged(*StarObj, *StarObj),
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
+            .type_name = "dict",
+            .setup_attrs = &setupAttrs,
         },
     },
 
@@ -1248,8 +1819,12 @@ pub const StarDict = struct {
             try entries.put(allocator, pairs[i], pairs[i + 1]);
         }
         self.* = .{ .entries = entries };
-        try self.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &self.obj, &strFn)).obj);
+        try setupAttrs(allocator, &self.obj);
         return self;
+    }
+
+    fn setupAttrs(allocator: Allocator, obj: *StarObj) Allocator.Error!void {
+        try obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, obj, &strFn)).obj);
     }
 
     fn strFn(allocator: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
@@ -1293,16 +1868,22 @@ pub const StarRangeIter = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
+            .type_name = "range_iterator",
+            .setup_attrs = &setupAttrs,
         },
     },
 
     pub fn init(allocator: Allocator, start: i64, stop: i64, step_val: i64) !*StarRangeIter {
         const self = try allocator.create(StarRangeIter);
         self.* = .{ .current = start, .stop = stop, .step = step_val };
-        try self.obj.attributes.put(allocator, dunder.iter, &(try StarBoundMethod.init(allocator, &self.obj, &iter)).obj);
-        try self.obj.attributes.put(allocator, dunder.next, &(try StarBoundMethod.init(allocator, &self.obj, &nextFn)).obj);
-        try self.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &self.obj, &strFn)).obj);
+        try setupAttrs(allocator, &self.obj);
         return self;
+    }
+
+    fn setupAttrs(allocator: Allocator, obj: *StarObj) Allocator.Error!void {
+        try obj.attributes.put(allocator, dunder.iter, &(try StarBoundMethod.init(allocator, obj, &iter)).obj);
+        try obj.attributes.put(allocator, dunder.next, &(try StarBoundMethod.init(allocator, obj, &nextFn)).obj);
+        try obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, obj, &strFn)).obj);
     }
 
     fn iter(_: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
@@ -1334,17 +1915,22 @@ pub const StarListIter = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
+            .type_name = "list_iterator",
+            .setup_attrs = &setupAttrs,
         },
     },
 
     pub fn init(allocator: Allocator, list: *StarList) !*StarListIter {
         const self = try allocator.create(StarListIter);
         self.* = .{ .list = list, .index = 0 };
-
-        try self.obj.attributes.put(allocator, dunder.iter, &(try StarBoundMethod.init(allocator, &self.obj, &iter)).obj);
-        try self.obj.attributes.put(allocator, dunder.next, &(try StarBoundMethod.init(allocator, &self.obj, &nextFn)).obj);
-        try self.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &self.obj, &strFn)).obj);
+        try setupAttrs(allocator, &self.obj);
         return self;
+    }
+
+    fn setupAttrs(allocator: Allocator, obj: *StarObj) Allocator.Error!void {
+        try obj.attributes.put(allocator, dunder.iter, &(try StarBoundMethod.init(allocator, obj, &iter)).obj);
+        try obj.attributes.put(allocator, dunder.next, &(try StarBoundMethod.init(allocator, obj, &nextFn)).obj);
+        try obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, obj, &strFn)).obj);
     }
 
     fn iter(_: Allocator, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
@@ -1377,6 +1963,7 @@ pub const StarBoundMethod = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
+            .type_name = "builtin_function_or_method",
         },
     },
 
@@ -1404,6 +1991,8 @@ pub const StarModule = struct {
     obj: StarObj = .{
         .vtable = StarObj.Vtable{
             .name = @typeName(@This()),
+            .type_name = "module",
+            .setup_attrs = &setupAttrs,
         },
     },
 
@@ -1416,6 +2005,10 @@ pub const StarModule = struct {
         return &new.obj;
     }
 
+    fn setupAttrs(allocator: Allocator, obj: *StarObj) Allocator.Error!void {
+        try obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, obj, &strFn)).obj);
+    }
+
     pub fn init(
         allocator: Allocator,
         name: []const u8,
@@ -1426,7 +2019,7 @@ pub const StarModule = struct {
             .name = name,
             .init_fn = init_fn,
         };
-        try self.obj.attributes.put(allocator, dunder.str, &(try StarBoundMethod.init(allocator, &self.obj, &strFn)).obj);
+        try setupAttrs(allocator, &self.obj);
         return self;
     }
 
@@ -1439,6 +2032,7 @@ pub const StarModule = struct {
             .names_local = &.{},
             .names_free = &.{},
             .names_global = module.global_names,
+            .kw_names = module.kw_names,
             .name = "<module>",
             .source_locs = module.source_locs,
         });
@@ -1451,12 +2045,38 @@ pub const StarObj = struct {
     attributes: std.StringHashMapUnmanaged(*StarObj) = .empty,
 
     pub const Vtable = struct {
+        /// Type identity used by `downCast`: each type's instance default
+        /// carries a unique pointer here, and `downCast` compares
+        /// `vtable.name.ptr` to determine type identity.
         name: []const u8,
+        /// User-facing type name returned by Starlark's `type()` builtin.
+        /// Defaults to `name`, but types should set it explicitly to the
+        /// spec-prescribed string ("int", "string", "list", ...). May be
+        /// overridden per-instance (e.g. native StarFunc →
+        /// "builtin_function_or_method").
+        type_name: []const u8,
+        /// Populate `obj.attributes` (dunder methods etc.) for a freshly-
+        /// constructed or shallow-cloned instance. Bound-method receivers
+        /// must point at `obj` (so they bind to the instance, not a
+        /// prototype). Called by both `<Type>.init` and `StarObj.cloneFrom`
+        /// so there's a single mechanism for setting up attributes.
+        setup_attrs: ?*const fn (allocator: Allocator, obj: *StarObj) Error!void = null,
 
         pub fn basePtr(self: *Vtable) *StarObj {
             return @fieldParentPtr("vtable", self);
         }
     };
+
+    /// Reset `self` to share `src`'s vtable but with a freshly-allocated
+    /// attributes table. Used by `make_function` and any other site that
+    /// instantiates a value by copying a prototype: the prototype's
+    /// `attributes` map storage and bound-method receivers must not leak
+    /// into the new instance.
+    pub fn cloneFrom(self: *StarObj, allocator: Allocator, src: *const StarObj) Error!void {
+        self.vtable = src.vtable;
+        self.attributes = .empty;
+        if (src.vtable.setup_attrs) |f| try f(allocator, self);
+    }
 
     pub fn setAttr(self: *StarObj, allocator: Allocator, name: *StarObj, value: *StarObj) Error!void {
         const n = try downCast(StarStr, name);
@@ -1582,8 +2202,7 @@ test "Runtime executes add function" {
     defer rt.deinit();
 
     var empty_args: [0]*StarObj = .{};
-    try rt.stackPush(&func.obj);
-    try rt.callFn(&func, empty_args[0..]);
+    try rt.callFn(&func, empty_args[0..], 0);
 
     try rt.stepUntilDone();
 
@@ -1664,8 +2283,7 @@ test "Runtime detects wrong arity" {
     defer rt.deinit();
 
     var no_args: [0]*StarObj = .{};
-    try rt.stackPush(&func.obj);
-    try std.testing.expectError(RuntimeError.ArityMismatch, rt.callFn(&func, no_args[0..]));
+    try std.testing.expectError(RuntimeError.ArityMismatch, rt.callFn(&func, no_args[0..], 0));
 }
 
 test "Instruction.load_const out of range" {
@@ -1688,8 +2306,7 @@ test "Instruction.load_const out of range" {
     defer rt.deinit();
 
     var no_args: [0]*StarObj = .{};
-    try rt.stackPush(&func.obj);
-    try rt.callFn(&func, no_args[0..]);
+    try rt.callFn(&func, no_args[0..], 0);
 
     try std.testing.expectError(RuntimeError.ConstOutOfRange, rt.step());
 }
@@ -1725,8 +2342,7 @@ test "Instruction.store and load locals" {
     defer rt.deinit();
 
     var no_args: [0]*StarObj = .{};
-    try rt.stackPush(&func.obj);
-    try rt.callFn(&func, no_args[0..]);
+    try rt.callFn(&func, no_args[0..], 0);
     try rt.stepUntilDone();
 
     const result_obj = rt.stack.items[0];
@@ -1757,8 +2373,7 @@ test "Instruction.call fails on non-function" {
     defer rt.deinit();
 
     var no_args: [0]*StarObj = .{};
-    try rt.stackPush(&func.obj);
-    try rt.callFn(&func, no_args[0..]);
+    try rt.callFn(&func, no_args[0..], 0);
 
     // push the const onto stack manually
     try rt.stackPush(&fake_func_obj.obj);
