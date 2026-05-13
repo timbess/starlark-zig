@@ -9,25 +9,22 @@ pub const Stdlib = Runtime.StarNativeModule(struct {
         return &new.obj;
     }
 
-    pub fn print(_: *Runtime, args: []const *Runtime.StarObj) Runtime.Error!?*Runtime.StarObj {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        var stdout_buf: [4096]u8 = undefined;
-        var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
-        var stdout = &stdout_writer.interface;
-        defer stdout.flush() catch @panic("Failed to flush");
+    pub fn print(rt: *Runtime, args: []const *Runtime.StarObj) Runtime.Error!?*Runtime.StarObj {
+        const out = rt.output;
+        defer out.flush() catch @panic("Failed to flush");
 
         for (args, 0..) |arg, i| {
-            if (i > 0) try stdout.print(" ", .{});
+            if (i > 0) try out.print(" ", .{});
 
             if (try arg.getMethodDunder(.str)) |str_method| {
                 const str_obj = try str_method.call(Gc.allocator(), &.{});
                 const str_val = try Runtime.downCast(Runtime.StarStr, str_obj);
-                try stdout.print("{s}", .{str_val.str});
+                try out.print("{s}", .{str_val.str});
             } else {
-                try stdout.print("<object>", .{});
+                try out.print("<object>", .{});
             }
         }
-        try stdout.print("\n", .{});
+        try out.print("\n", .{});
         return null;
     }
 

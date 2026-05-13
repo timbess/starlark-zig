@@ -60,6 +60,7 @@ pub fn main(init: std.process.Init) !void {
     var runtime = try Runtime.init(gpa, .{
         .gc = gc,
         .frame_alloc = frame_alloc.get(),
+        .output = stdout,
     });
     defer runtime.deinit();
 

@@ -12,6 +12,8 @@ const log = std.log.scoped(scope);
 gpa: Allocator,
 gc: Allocator,
 frame_alloc: Allocator = undefined,
+/// Where the Starlark `print` builtin writes.
+output: *std.Io.Writer = &discarding_output.writer,
 /// Call stack for code/locals
 frames: std.ArrayList(Frame) = .empty,
 /// Value stack
@@ -71,7 +73,14 @@ pub const InitOpts = struct {
     gc: Allocator,
     /// Allows for optimizing frame allocation with either a fixed-size bump allocator or whatever the user pleases.
     frame_alloc: ?Allocator = null,
+    /// Sink for the Starlark `print` builtin. If null, a process-static
+    /// discarding writer is used. The CLI passes its stdout writer here; tests
+    /// leave it null so prints don't escape to wherever stdout points.
+    output: ?*std.Io.Writer = null,
 };
+
+var discarding_output_buf: [256]u8 = undefined;
+var discarding_output: std.Io.Writer.Discarding = .init(&discarding_output_buf);
 
 pub const GlobalIdx = enum(u32) { _ };
 pub const LocalIdx = enum(u32) { _ };
@@ -381,6 +390,7 @@ pub fn init(gpa: Allocator, opts: InitOpts) !Runtime {
         .gpa = gpa,
         .gc = opts.gc,
         .frame_alloc = opts.frame_alloc orelse opts.gc,
+        .output = opts.output orelse &discarding_output.writer,
     };
 }
 
