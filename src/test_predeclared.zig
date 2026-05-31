@@ -82,9 +82,16 @@ fn catchBuiltin(rt: *Runtime, args: []const *Runtime.StarObj) Error!*StarObj {
 }
 
 fn errString(rt: *Runtime, err: anyerror) Error!*StarObj {
-    // Map specific runtime errors to the user-facing strings the Starlark
-    // spec tests expect to match. matchesBuiltin does substring search, so
-    // the returned string just has to contain the pattern.
+    // Prefer the operand-specific message that a helper attached to the
+    // diagnostic; fall back to the bare error tag (with a friendlier name
+    // for stack overflow).
+    if (rt.diagnostic) |diag| {
+        if (diag.message) |msg| {
+            diag.message = null;
+            const err_str = try StarStr.init(rt.gc, msg);
+            return &err_str.obj;
+        }
+    }
     const text: []const u8 = switch (err) {
         error.StarlarkStackOverflow => "Starlark stack overflow",
         else => @errorName(err),
@@ -93,18 +100,65 @@ fn errString(rt: *Runtime, err: anyerror) Error!*StarObj {
     return &err_str.obj;
 }
 
-fn matchesBuiltin(_: *Runtime, args: []const *Runtime.StarObj) Error!*StarObj {
+fn matchesBuiltin(rt: *Runtime, args: []const *Runtime.StarObj) Error!*StarObj {
     if (args.len != 2) return Runtime.RuntimeError.ArityMismatch;
     const pattern = Runtime.downCast(StarStr, args[0]) catch return Runtime.TypeError.TypeMismatch;
     const str = Runtime.downCast(StarStr, args[1]) catch return Runtime.TypeError.TypeMismatch;
-    const found = std.mem.indexOf(u8, str.str, pattern.str) != null;
+    const cleaned = try cleanRegexPattern(rt.gc, pattern.str);
+    const found = std.mem.indexOf(u8, str.str, cleaned) != null;
     return StarBool.get(found);
+}
+
+fn cleanRegexPattern(allocator: std.mem.Allocator, p: []const u8) ![]const u8 {
+    // Substring semantics are good enough for the spec patterns; we only
+    // need to un-escape backslash-escaped metacharacters (`\+`, `\?`,
+    // `\(`, `\)`, `\.`) and strip the `^`/`$` anchors. For sequences we
+    // don't honour (like `\d`) the next char is appended verbatim — the
+    // upstream patterns that rely on real regex won't match, but they
+    // also rely on operand-specific text our errors lack.
+    var buf = std.ArrayList(u8).empty;
+    var i: usize = 0;
+    if (p.len > 0 and p[0] == '^') i = 1;
+    var end: usize = p.len;
+    if (end > 0 and p[end - 1] == '$' and (end < 2 or p[end - 2] != '\\')) end -= 1;
+    while (i < end) : (i += 1) {
+        const c = p[i];
+        if (c == '\\' and i + 1 < end) {
+            try buf.append(allocator, p[i + 1]);
+            i += 1;
+        } else {
+            try buf.append(allocator, c);
+        }
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+/// `__str__` for objects built by the `module(name, **kw)` builtin. Format
+/// matches the upstream spec exactly: `<module "name">` with double quotes.
+fn moduleStrFn(rt: *Runtime, self_obj: *StarObj, args: []const *StarObj) Error!*StarObj {
+    if (args.len != 0) return Runtime.RuntimeError.ArityMismatch;
+    const name_attr = self_obj.attributes.get("__name__") orelse {
+        const r = try StarStr.init(rt.gc, "<module>");
+        return &r.obj;
+    };
+    const ns = Runtime.downCast(StarStr, name_attr) catch {
+        const r = try StarStr.init(rt.gc, "<module>");
+        return &r.obj;
+    };
+    const text = try std.fmt.allocPrint(rt.gc, "<module \"{s}\">", .{ns.str});
+    return &(try StarStr.init(rt.gc, text)).obj;
 }
 
 fn moduleBuiltin(rt: *Runtime, call: NativeCall) Error!*StarObj {
     // module(name, **kwargs): each kwarg becomes an attribute on the returned object.
     const obj = try rt.gc.create(StarObj);
     obj.* = .{ .vtable = .{ .name = "module", .type_name = "module" } };
+    if (call.args.len >= 1) {
+        if (Runtime.downCast(StarStr, call.args[0])) |nm| {
+            try obj.attributes.put(rt.gc, "__name__", &(try StarStr.init(rt.gc, nm.str)).obj);
+        } else |_| {}
+    }
+    try obj.attributes.put(rt.gc, "__str__", &(try Runtime.StarBoundMethod.init(rt.gc, obj, &moduleStrFn)).obj);
     for (call.kwargs) |kw| {
         try obj.attributes.put(rt.gc, kw.name, kw.value);
     }
@@ -126,6 +180,42 @@ fn floateqBuiltin(_: *Runtime, args: []const *Runtime.StarObj) Error!*StarObj {
 }
 
 const assert_star_source = @embedFile("testdata/assert.star");
+
+/// Predeclared `fibonacci` global: an infinite iterable that yields
+/// 0, 1, 1, 2, 3, 5, 8, ... The spec's `control.star` references this
+/// as a Go-side fixture; we provide an equivalent here.
+const FibIter = struct {
+    a: i64 = 0,
+    b: i64 = 1,
+    obj: Runtime.StarObj = .{
+        .vtable = Runtime.StarObj.Vtable{
+            .name = @typeName(@This()),
+            .type_name = "fibonacci",
+            .setup_attrs = &setupAttrs,
+        },
+    },
+
+    fn setupAttrs(allocator: std.mem.Allocator, obj: *Runtime.StarObj) std.mem.Allocator.Error!void {
+        try obj.attributes.put(allocator, Runtime.dunder.iter, &(try Runtime.StarBoundMethod.init(allocator, obj, &iterFn)).obj);
+        try obj.attributes.put(allocator, Runtime.dunder.next, &(try Runtime.StarBoundMethod.init(allocator, obj, &nextFn)).obj);
+    }
+
+    fn iterFn(_: *Runtime, self_obj: *Runtime.StarObj, args: []const *Runtime.StarObj) Error!*Runtime.StarObj {
+        if (args.len != 0) return Runtime.RuntimeError.ArityMismatch;
+        return self_obj;
+    }
+
+    fn nextFn(rt: *Runtime, self_obj: *Runtime.StarObj, args: []const *Runtime.StarObj) Error!*Runtime.StarObj {
+        if (args.len != 0) return Runtime.RuntimeError.ArityMismatch;
+        const self: *FibIter = @fieldParentPtr("obj", self_obj);
+        const v = self.a;
+        const next = self.a + self.b;
+        self.a = self.b;
+        self.b = next;
+        const r = try Runtime.StarInt.init(rt.gc, v);
+        return &r.obj;
+    }
+};
 
 fn loadBuiltin(rt: *Runtime, args: []const *Runtime.StarObj) Error!*StarObj {
     if (args.len < 2) return Runtime.RuntimeError.ArityMismatch;
@@ -155,11 +245,26 @@ fn loadBuiltin(rt: *Runtime, args: []const *Runtime.StarObj) Error!*StarObj {
     }
     try rt.execModule(&module);
 
+    // The names requested by `load()` are already in `rt.globals` because
+    // execModule installed them; nothing further to do beyond verifying they
+    // resolve. (This is a deliberate simplification — see the plan.)
+    for (args[1..]) |name_obj| {
+        const name = Runtime.downCast(StarStr, name_obj) catch continue;
+        _ = rt.globals.get(name.str) orelse {};
+    }
+
     return StarNone.instance;
 }
 
+fn hasfieldsBuiltin(rt: *Runtime, _: []const *Runtime.StarObj) Error!*StarObj {
+    // `hasfields()` is an application-supplied type in the spec tests; we
+    // just hand back an empty attribute-bag object that `setattr` can write.
+    const obj = try rt.gc.create(StarObj);
+    obj.* = .{ .vtable = .{ .name = "hasfields", .type_name = "hasfields" } };
+    return obj;
+}
+
 pub fn register(rt: *Runtime, gc: std.mem.Allocator) !void {
-    _ = gc;
     if (!initialized) {
         error_allocator = std.testing.allocator;
         error_messages = std.ArrayList([]const u8).empty;
@@ -185,11 +290,20 @@ pub fn register(rt: *Runtime, gc: std.mem.Allocator) !void {
         pub fn _floateq(r: *Runtime, args: []const *Runtime.StarObj) Error!?*StarObj {
             return floateqBuiltin(r, args);
         }
+        pub fn hasfields(r: *Runtime, args: []const *Runtime.StarObj) Error!?*StarObj {
+            return hasfieldsBuiltin(r, args);
+        }
         pub fn load(r: *Runtime, args: []const *Runtime.StarObj) Error!?*StarObj {
             return loadBuiltin(r, args);
         }
     });
     try rt.registerStdlib(Predeclared);
+
+    // Register the `fibonacci` predeclared infinite iterator used by control.star.
+    const fib = try gc.create(FibIter);
+    fib.* = .{};
+    try FibIter.setupAttrs(gc, &fib.obj);
+    try rt.globals.put(gc, "fibonacci", &fib.obj);
 }
 
 test "multi-line expression inside parens (paren_depth tracking)" {

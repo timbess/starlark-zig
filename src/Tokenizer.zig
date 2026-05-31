@@ -10,6 +10,11 @@ paren_depth: usize = 0,
 /// level dedent. Each emission pops one level off `indent_stack` and
 /// decrements this counter.
 pending_dedents: usize = 0,
+/// True when the next emission should run indentation processing first
+/// (we just finished a logical line and the `.newline` token has been
+/// handed to the parser). Decouples the per-line NEWLINE emission from
+/// the per-line INDENT/DEDENT decision.
+at_line_start: bool = false,
 /// The opening quote character of the string currently being tokenized.
 string_quote: u8 = 0,
 state: State = .start,
@@ -56,6 +61,7 @@ pub const Token = struct {
         gt_eq,
         block_start,
         block_end,
+        newline,
         keyword_def,
         keyword_return,
         keyword_and,
@@ -155,7 +161,15 @@ pub fn next(self: *Tokenizer) Error!Token {
         .end = undefined,
     } };
     var indent: usize = 0;
-    state: switch (State.initial_state) {
+    // After emitting a `.newline`, the very next call must compute the new
+    // line's indent before consuming its first character. Routing through
+    // the `.indentation` state handles same-indent, block_start, and the
+    // block_end-with-pending-dedents case uniformly.
+    const initial: State = if (self.at_line_start) blk: {
+        self.at_line_start = false;
+        break :blk .indentation;
+    } else State.initial_state;
+    state: switch (initial) {
         .start => {
             switch (self.source[self.index]) {
                 // String is null terminated to make EOF handling nicer.
@@ -190,8 +204,11 @@ pub fn next(self: *Tokenizer) Error!Token {
                         result.loc.start = self.index;
                         continue :state .start;
                     }
-                    indent = 0;
-                    continue :state .indentation;
+                    // Emit the logical-line terminator now. Indent processing
+                    // (block_start/block_end) happens on the next call, gated
+                    // by `at_line_start`.
+                    self.at_line_start = true;
+                    result.tag = .newline;
                 },
                 // Should only handle mid-line WS.
                 '\t', ' ' => {
@@ -206,6 +223,17 @@ pub fn next(self: *Tokenizer) Error!Token {
                     }
                     result.loc.start = self.index;
                     continue :state .start;
+                },
+                '\\' => {
+                    // `\` is only valid as a line continuation outside strings.
+                    self.index += 1;
+                    if (self.source[self.index] == '\r') self.index += 1;
+                    if (self.source[self.index] == '\n') {
+                        self.index += 1;
+                        result.loc.start = self.index;
+                        continue :state .start;
+                    }
+                    continue :state .invalid;
                 },
                 '=' => {
                     self.index += 1;
@@ -331,6 +359,24 @@ pub fn next(self: *Tokenizer) Error!Token {
                     self.index += 1;
                     continue :state .indentation;
                 },
+                // Blank and comment-only lines must not emit block_end:
+                // they don't actually change the current indentation level.
+                '\n', '\r' => {
+                    self.index += 1;
+                    indent = 0;
+                    continue :state .indentation;
+                },
+                '#' => {
+                    while (self.source[self.index] != 0 and self.source[self.index] != '\n') {
+                        self.index += 1;
+                    }
+                    if (self.source[self.index] == '\n') {
+                        self.index += 1;
+                        indent = 0;
+                        continue :state .indentation;
+                    }
+                    continue :state .start;
+                },
                 else => {
                     const cur = self.currentIndent();
                     if (indent == cur) {
@@ -366,7 +412,7 @@ pub fn next(self: *Tokenizer) Error!Token {
         },
         .identifier => {
             switch (self.source[self.index]) {
-                'a'...'z', 'A'...'Z', '_' => {
+                'a'...'z', 'A'...'Z', '_', '0'...'9' => {
                     self.index += 1;
                     continue :state .identifier;
                 },
@@ -399,6 +445,42 @@ pub fn next(self: *Tokenizer) Error!Token {
                     if (v == .number and d == '.') continue :state .number_w_decimal;
                     self.index += 1;
                     continue :state v;
+                },
+                'e', 'E' => {
+                    self.index += 1;
+                    if (self.source[self.index] == '+' or self.source[self.index] == '-') {
+                        self.index += 1;
+                    }
+                    while (self.source[self.index] >= '0' and self.source[self.index] <= '9') {
+                        self.index += 1;
+                    }
+                    result.tag = .number_literal;
+                },
+                'x', 'X' => {
+                    self.index += 1;
+                    while (true) {
+                        const c2 = self.source[self.index];
+                        const is_hex = (c2 >= '0' and c2 <= '9') or
+                            (c2 >= 'a' and c2 <= 'f') or
+                            (c2 >= 'A' and c2 <= 'F');
+                        if (!is_hex) break;
+                        self.index += 1;
+                    }
+                    result.tag = .number_literal;
+                },
+                'o', 'O' => {
+                    self.index += 1;
+                    while (self.source[self.index] >= '0' and self.source[self.index] <= '7') {
+                        self.index += 1;
+                    }
+                    result.tag = .number_literal;
+                },
+                'b', 'B' => {
+                    self.index += 1;
+                    while (self.source[self.index] == '0' or self.source[self.index] == '1') {
+                        self.index += 1;
+                    }
+                    result.tag = .number_literal;
                 },
                 else => {
                     result.tag = .number_literal;
@@ -518,6 +600,7 @@ test Tokenizer {
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "asdf" });
         try Test.expectToken(&tokenizer, .{ .tag = .eq,             .text = "=" });
         try Test.expectToken(&tokenizer, .{ .tag = .number_literal, .text = "1" });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline,        .text = "\n" });
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "foo" });
         try Test.expectToken(&tokenizer, .{ .tag = .eq,             .text = "=" });
         try Test.expectToken(&tokenizer, .{ .tag = .number_literal, .text = "2.0" });
@@ -537,11 +620,13 @@ test Tokenizer {
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "asdf" });
         try Test.expectToken(&tokenizer, .{ .tag = .eq,             .text = "=" });
         try Test.expectToken(&tokenizer, .{ .tag = .number_literal, .text = "1" });
-        try Test.expectToken(&tokenizer, .{ .tag = .block_start,    .text = "\n  " });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline,        .text = "\n" });
+        try Test.expectToken(&tokenizer, .{ .tag = .block_start,    .text = "  " });
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "foo" });
         try Test.expectToken(&tokenizer, .{ .tag = .eq,             .text = "=" });
         try Test.expectToken(&tokenizer, .{ .tag = .number_literal, .text = "2.0" });
-        try Test.expectToken(&tokenizer, .{ .tag = .block_start,    .text = "\n    " });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline,        .text = "\n" });
+        try Test.expectToken(&tokenizer, .{ .tag = .block_start,    .text = "    " });
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "bar" });
         try Test.expectToken(&tokenizer, .{ .tag = .eq,             .text = "=" });
         try Test.expectToken(&tokenizer, .{ .tag = .number_literal, .text = "3.0" });
@@ -568,16 +653,20 @@ test Tokenizer {
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "asdf" });
         try Test.expectToken(&tokenizer, .{ .tag = .eq,             .text = "=" });
         try Test.expectToken(&tokenizer, .{ .tag = .number_literal, .text = "1" });
-        try Test.expectToken(&tokenizer, .{ .tag = .block_start,    .text = "\n  " });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline,        .text = "\n" });
+        try Test.expectToken(&tokenizer, .{ .tag = .block_start,    .text = "  " });
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "foo" });
         try Test.expectToken(&tokenizer, .{ .tag = .eq,             .text = "=" });
         try Test.expectToken(&tokenizer, .{ .tag = .number_literal, .text = "2.0" });
-        try Test.expectToken(&tokenizer, .{ .tag = .block_start,    .text = "\n    " });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline,        .text = "\n" });
+        try Test.expectToken(&tokenizer, .{ .tag = .block_start,    .text = "    " });
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "bar" });
         try Test.expectToken(&tokenizer, .{ .tag = .eq,             .text = "=" });
         try Test.expectToken(&tokenizer, .{ .tag = .number_literal, .text = "3.0" });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline,        .text = "\n" });
         try Test.expectToken(&tokenizer, .{ .tag = .block_end,      .text = "" });
         try Test.expectToken(&tokenizer, .{ .tag = .number_literal, .text = "1" });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline,        .text = "\n" });
         try Test.expectToken(&tokenizer, .{ .tag = .block_end,      .text = "" });
         try Test.expectToken(&tokenizer, .{ .tag = .keyword_def,    .text = "def" });
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "my_fn" });
@@ -585,11 +674,13 @@ test Tokenizer {
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "name" });
         try Test.expectToken(&tokenizer, .{ .tag = .r_paren,        .text = ")" });
         try Test.expectToken(&tokenizer, .{ .tag = .colon,          .text = ":" });
-        try Test.expectToken(&tokenizer, .{ .tag = .block_start,    .text = "\n  " });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline,        .text = "\n" });
+        try Test.expectToken(&tokenizer, .{ .tag = .block_start,    .text = "  " });
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "println" });
         try Test.expectToken(&tokenizer, .{ .tag = .l_paren,        .text = "(" });
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "name" });
         try Test.expectToken(&tokenizer, .{ .tag = .r_paren,        .text = ")" });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline,        .text = "\n" });
         try Test.expectToken(&tokenizer, .{ .tag = .keyword_return, .text = "return" });
         try Test.expectToken(&tokenizer, .{ .tag = .number_literal, .text = "1" });
         try Test.expectToken(&tokenizer, .{ .tag = .block_end,      .text = "" });
@@ -625,14 +716,20 @@ test Tokenizer {
         var tokenizer = Tokenizer.init(code);
 
         // zig fmt: off
-        try Test.expectToken(&tokenizer, .{ .tag = .string, .text = "'foo'" });
-        try Test.expectToken(&tokenizer, .{ .tag = .string, .text = "\"can't\"" });
-        try Test.expectToken(&tokenizer, .{ .tag = .string, .text = "'say \"hi\"'" });
-        try Test.expectToken(&tokenizer, .{ .tag = .string, .text = "'don\\'t'" });
-        try Test.expectToken(&tokenizer, .{ .tag = .string, .text = "\"a\\\"b\"" });
-        try Test.expectToken(&tokenizer, .{ .tag = .string, .text = "''" });
-        try Test.expectToken(&tokenizer, .{ .tag = .string, .text = "\"\"" });
-        try Test.expectToken(&tokenizer, .{ .tag = .eof,    .text = "" });
+        try Test.expectToken(&tokenizer, .{ .tag = .string,  .text = "'foo'" });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline, .text = "\n" });
+        try Test.expectToken(&tokenizer, .{ .tag = .string,  .text = "\"can't\"" });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline, .text = "\n" });
+        try Test.expectToken(&tokenizer, .{ .tag = .string,  .text = "'say \"hi\"'" });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline, .text = "\n" });
+        try Test.expectToken(&tokenizer, .{ .tag = .string,  .text = "'don\\'t'" });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline, .text = "\n" });
+        try Test.expectToken(&tokenizer, .{ .tag = .string,  .text = "\"a\\\"b\"" });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline, .text = "\n" });
+        try Test.expectToken(&tokenizer, .{ .tag = .string,  .text = "''" });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline, .text = "\n" });
+        try Test.expectToken(&tokenizer, .{ .tag = .string,  .text = "\"\"" });
+        try Test.expectToken(&tokenizer, .{ .tag = .eof,     .text = "" });
         // zig fmt: on
     }
     {
@@ -664,12 +761,15 @@ test Tokenizer {
         try Test.expectToken(&tokenizer, .{ .tag = .l_paren,        .text = "(" });
         try Test.expectToken(&tokenizer, .{ .tag = .r_paren,        .text = ")" });
         try Test.expectToken(&tokenizer, .{ .tag = .colon,          .text = ":" });
-        try Test.expectToken(&tokenizer, .{ .tag = .block_start,    .text = "\n    " });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline,        .text = "\n" });
+        try Test.expectToken(&tokenizer, .{ .tag = .block_start,    .text = "    " });
         try Test.expectToken(&tokenizer, .{ .tag = .keyword_if,     .text = "if" });
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "x" });
         try Test.expectToken(&tokenizer, .{ .tag = .colon,          .text = ":" });
-        try Test.expectToken(&tokenizer, .{ .tag = .block_start,    .text = "\n\t" });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline,        .text = "\n" });
+        try Test.expectToken(&tokenizer, .{ .tag = .block_start,    .text = "\t" });
         try Test.expectToken(&tokenizer, .{ .tag = .keyword_pass,   .text = "pass" });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline,        .text = "\n" });
         try Test.expectToken(&tokenizer, .{ .tag = .block_end,      .text = "" });
         try Test.expectToken(&tokenizer, .{ .tag = .block_end,      .text = "" });
         try Test.expectToken(&tokenizer, .{ .tag = .eof,            .text = "" });
@@ -689,12 +789,15 @@ test Tokenizer {
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "a" });
         try Test.expectToken(&tokenizer, .{ .tag = .slash,          .text = "/" });
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "b" });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline,        .text = "\n" });
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "a" });
         try Test.expectToken(&tokenizer, .{ .tag = .slash_slash,    .text = "//" });
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "b" });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline,        .text = "\n" });
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "a" });
         try Test.expectToken(&tokenizer, .{ .tag = .pipe,           .text = "|" });
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "b" });
+        try Test.expectToken(&tokenizer, .{ .tag = .newline,        .text = "\n" });
         try Test.expectToken(&tokenizer, .{ .tag = .keyword_lambda, .text = "lambda" });
         try Test.expectToken(&tokenizer, .{ .tag = .identifier,     .text = "x" });
         try Test.expectToken(&tokenizer, .{ .tag = .colon,          .text = ":" });

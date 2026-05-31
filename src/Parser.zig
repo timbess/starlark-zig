@@ -120,12 +120,241 @@ pub fn parse(self: *Parser) !void {
     std.debug.assert(@intFromEnum(self.tokenIdx()) == self.tokens.len);
 }
 
+/// A statement is either an unpack assignment (`a, b = ...`,
+/// `(a, b) = ...`, `obj[i] = ...`, `obj.attr = ...`), an augmented
+/// assignment on a non-bare-identifier LHS, or an ordinary expression
+/// statement. The bare-tuple form is detected by depth-aware look-ahead
+/// because the expression parser eagerly consumes `IDENT =` as a
+/// `var_definition`, which would mis-parse `a, b = 1, 2` as `a; b = 1; , 2`.
+fn parseStatement(self: *Parser) Error!Node.Index {
+    if (self.statementIsBareUnpack()) {
+        return self.parseBareUnpackStatement();
+    }
+
+    const first = try self.expectExpr();
+
+    if (self.currentTag() == .eq) {
+        const first_node = self.nodes.get(@intFromEnum(first));
+        const first_data = first_node.data;
+        if (first_data == .tuple_literal or first_data == .list_literal) {
+            self.advance();
+            const value = try self.parseRhsValue();
+            return try self.addNode(.{
+                .main_token = first_node.main_token,
+                .data = .{ .unpack_assignment = .{ .target = first, .value = value } },
+            });
+        }
+        if (first_data == .index) {
+            self.advance();
+            const value = try self.parseRhsValue();
+            return try self.addNode(.{
+                .main_token = first_node.main_token,
+                .data = .{ .set_item = .{
+                    .obj = first_data.index.obj,
+                    .idx = first_data.index.idx,
+                    .value = value,
+                } },
+            });
+        }
+        if (first_data == .get_attribute) {
+            self.advance();
+            const value = try self.parseRhsValue();
+            return try self.addNode(.{
+                .main_token = first_node.main_token,
+                .data = .{ .set_attr = .{
+                    .obj = first_data.get_attribute.obj,
+                    .attr = first_data.get_attribute.attr,
+                    .value = value,
+                } },
+            });
+        }
+    }
+
+    if (self.consumeOneOf(&.{ .plus_eq, .minus_eq, .star_eq, .slash_eq, .slash_slash_eq, .percent_eq, .pipe_eq })) |op_tok| {
+        const first_node = self.nodes.get(@intFromEnum(first));
+        const op_tag = self.tokens.items(.tag)[@intFromEnum(op_tok)];
+        const rhs = try self.expectExpr();
+        switch (first_node.data) {
+            .index => {
+                const lhs_load = try self.addNode(.{
+                    .main_token = first_node.main_token,
+                    .data = .{ .index = first_node.data.index },
+                });
+                const binop_node = try self.addNode(switch (op_tag) {
+                    .plus_eq => .{ .main_token = op_tok, .data = .{ .add = .{ .lhs = lhs_load, .rhs = rhs } } },
+                    .minus_eq => .{ .main_token = op_tok, .data = .{ .sub = .{ .lhs = lhs_load, .rhs = rhs } } },
+                    .star_eq => .{ .main_token = op_tok, .data = .{ .mul = .{ .lhs = lhs_load, .rhs = rhs } } },
+                    .slash_eq => .{ .main_token = op_tok, .data = .{ .div = .{ .lhs = lhs_load, .rhs = rhs } } },
+                    .slash_slash_eq => .{ .main_token = op_tok, .data = .{ .floor_div = .{ .lhs = lhs_load, .rhs = rhs } } },
+                    .percent_eq => .{ .main_token = op_tok, .data = .{ .mod = .{ .lhs = lhs_load, .rhs = rhs } } },
+                    .pipe_eq => .{ .main_token = op_tok, .data = .{ .bit_or = .{ .lhs = lhs_load, .rhs = rhs } } },
+                    else => unreachable,
+                });
+                return try self.addNode(.{
+                    .main_token = first_node.main_token,
+                    .data = .{ .set_item = .{
+                        .obj = first_node.data.index.obj,
+                        .idx = first_node.data.index.idx,
+                        .value = binop_node,
+                    } },
+                });
+            },
+            .identifier => {
+                const binop_node = try self.addNode(switch (op_tag) {
+                    .plus_eq => .{ .main_token = op_tok, .data = .{ .add = .{ .lhs = first, .rhs = rhs } } },
+                    .minus_eq => .{ .main_token = op_tok, .data = .{ .sub = .{ .lhs = first, .rhs = rhs } } },
+                    .star_eq => .{ .main_token = op_tok, .data = .{ .mul = .{ .lhs = first, .rhs = rhs } } },
+                    .slash_eq => .{ .main_token = op_tok, .data = .{ .div = .{ .lhs = first, .rhs = rhs } } },
+                    .slash_slash_eq => .{ .main_token = op_tok, .data = .{ .floor_div = .{ .lhs = first, .rhs = rhs } } },
+                    .percent_eq => .{ .main_token = op_tok, .data = .{ .mod = .{ .lhs = first, .rhs = rhs } } },
+                    .pipe_eq => .{ .main_token = op_tok, .data = .{ .bit_or = .{ .lhs = first, .rhs = rhs } } },
+                    else => unreachable,
+                });
+                return try self.addNode(.{
+                    .main_token = first_node.main_token,
+                    .data = .{ .var_definition = .{
+                        .binding = first_node.main_token,
+                        .value = binop_node,
+                    } },
+                });
+            },
+            else => return self.fail(.expected_expr),
+        }
+    }
+
+    return first;
+}
+
+/// Depth-aware look-ahead: returns true iff the statement is a bare-tuple
+/// unpack (`a, b, ... = ...`), recognised by at least one depth-0 comma
+/// before a depth-0 `=`. Augmented-assignment operators (`+=` etc.) at
+/// depth 0 disqualify the statement.
+fn statementIsBareUnpack(self: *Parser) bool {
+    var i: u32 = self.token_idx;
+    var depth: u32 = 0;
+    var saw_comma = false;
+    const tags = self.tokens.items(.tag);
+    while (i < tags.len) : (i += 1) {
+        const t = tags[i];
+        switch (t) {
+            .l_paren, .l_bracket, .l_brace => depth += 1,
+            .r_paren, .r_bracket, .r_brace => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            .comma => if (depth == 0) {
+                saw_comma = true;
+            },
+            .eq => if (depth == 0) return saw_comma,
+            .plus_eq, .minus_eq, .star_eq, .slash_eq, .slash_slash_eq, .percent_eq, .pipe_eq => {
+                if (depth == 0) return false;
+            },
+            .block_end, .block_start, .eof => if (depth == 0) return false,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn parseBareUnpackStatement(self: *Parser) Error!Node.Index {
+    const old_len = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(old_len);
+
+    const start_tok = self.tokenIdx();
+    try self.scratch.append(self.gpa, try self.parseAtomTarget());
+
+    while (self.consume(.comma)) |_| {
+        if (self.currentTag() == .eq) break;
+        try self.scratch.append(self.gpa, try self.parseAtomTarget());
+    }
+
+    _ = try self.expectConsume(.eq);
+
+    const elements = try self.arena.allocator().dupe(Node.Index, self.scratch.items[old_len..]);
+    const target = try self.addNode(.{
+        .main_token = start_tok,
+        .data = .{ .tuple_literal = .{ .elements = elements } },
+    });
+
+    const value = try self.parseRhsValue();
+    return try self.addNode(.{
+        .main_token = start_tok,
+        .data = .{ .unpack_assignment = .{ .target = target, .value = value } },
+    });
+}
+
+/// Parse one target in an unpacking pattern. The identifier path here must
+/// NOT take the `IDENT = expr` branch in `parseExprWithoutOperators`, so we
+/// pick the atom apart manually.
+fn parseAtomTarget(self: *Parser) Error!Node.Index {
+    const t = self.currentTag() orelse return self.fail(.expected_expr);
+    switch (t) {
+        .identifier => {
+            const tok = self.consumeNext();
+            return try self.addNode(.{
+                .main_token = tok,
+                .data = .{ .identifier = {} },
+            });
+        },
+        .l_paren => return self.parseParenTarget(),
+        .l_bracket => return self.parseListLiteral(),
+        else => return self.fail(.expected_expr),
+    }
+}
+
+fn parseParenTarget(self: *Parser) Error!Node.Index {
+    const lparen = try self.expectConsume(.l_paren);
+    if (self.consume(.r_paren)) |_| {
+        return try self.addNode(.{
+            .main_token = lparen,
+            .data = .{ .tuple_literal = .{ .elements = &.{} } },
+        });
+    }
+    const old_len = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(old_len);
+    try self.scratch.append(self.gpa, try self.parseAtomTarget());
+    while (self.consume(.comma)) |_| {
+        if (self.currentTag() == .r_paren) break;
+        try self.scratch.append(self.gpa, try self.parseAtomTarget());
+    }
+    _ = try self.expectConsume(.r_paren);
+    const elements = try self.arena.allocator().dupe(Node.Index, self.scratch.items[old_len..]);
+    return try self.addNode(.{
+        .main_token = lparen,
+        .data = .{ .tuple_literal = .{ .elements = elements } },
+    });
+}
+
+/// Parse the RHS of an assignment, allowing bare-tuple syntax so
+/// `x = 1, 2, 3` binds the tuple `(1, 2, 3)`.
+fn parseRhsValue(self: *Parser) Error!Node.Index {
+    const first = try self.expectExpr();
+    if (self.currentTag() != .comma) return first;
+
+    const old_len = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(old_len);
+    try self.scratch.append(self.gpa, first);
+    const main_tok = self.nodes.get(@intFromEnum(first)).main_token;
+
+    while (self.consume(.comma)) |_| {
+        if (self.currentTag() == .block_end or self.currentTag() == .eof) break;
+        try self.scratch.append(self.gpa, try self.expectExpr());
+    }
+
+    const elements = try self.arena.allocator().dupe(Node.Index, self.scratch.items[old_len..]);
+    return try self.addNode(.{
+        .main_token = main_tok,
+        .data = .{ .tuple_literal = .{ .elements = elements } },
+    });
+}
+
 // TODO: Rethink this design.
 const BlockOpts = struct { root_level: bool = false };
 pub fn blockExpr(self: *Parser, comptime opts: BlockOpts) !Node.Index {
     const old_len = self.scratch.items.len;
     defer self.scratch.shrinkRetainingCapacity(old_len);
 
+    self.skipNewlines();
     const current_token =
         if (opts.root_level) self.tokenIdx() else try self.expectConsume(.block_start);
 
@@ -136,6 +365,7 @@ pub fn blockExpr(self: *Parser, comptime opts: BlockOpts) !Node.Index {
     errdefer self.nodes.clearRetainingCapacity();
 
     while (self.token_idx < self.tokens.len) {
+        self.skipNewlines();
         if (opts.root_level) {
             if (self.consume(.eof)) |_| {
                 break;
@@ -145,13 +375,18 @@ pub fn blockExpr(self: *Parser, comptime opts: BlockOpts) !Node.Index {
                 break;
             }
         }
-        try self.scratch.append(self.gpa, try self.expectExpr());
+        try self.scratch.append(self.gpa, try self.parseStatement());
+        _ = self.consume(.newline);
     }
 
     const statements = try self.arena.allocator().dupe(Node.Index, self.scratch.items[old_len..]);
     self.nodeData(node_idx).* = .{ .block = .{ .statements = statements } };
 
     return node_idx;
+}
+
+fn skipNewlines(self: *Parser) void {
+    while (self.consume(.newline)) |_| {}
 }
 
 pub fn parseFnArgs(self: *Parser) Error!Node.Index {
@@ -170,7 +405,22 @@ fn parseParamList(self: *Parser, main_token: Token.Index, terminator: Token.Tag)
 
     while (true) {
         if (self.currentTag() == terminator) break;
-        if (self.consume(.identifier)) |arg_name| {
+        // Accept (but for now drop into a no-default placeholder) Starlark's
+        // varargs forms in function signatures: `*args`, `**kwargs`, and the
+        // bare `*` keyword-only separator. The runtime doesn't honour these
+        // yet, but the parser must not reject them so spec tests can compile.
+        if (self.consume(.starstar)) |_| {
+            if (self.consume(.identifier)) |arg_name| {
+                try self.scratch.append(self.gpa, try self.addNode(.{
+                    .main_token = arg_name,
+                    .data = .{ .fn_arg = .{ .binding = arg_name, .default = .none } },
+                }));
+            }
+        } else if (self.consume(.star)) |_| {
+            // Either `*name` or a bare `*`. Either way, just consume and
+            // skip — no fn_arg node is added.
+            _ = self.consume(.identifier);
+        } else if (self.consume(.identifier)) |arg_name| {
             const default_val: Ast.Node.Index = if (self.consume(.eq)) |_|
                 try self.expectExpr()
             else
@@ -351,7 +601,8 @@ pub fn parseExprWithoutOperators(self: *Parser) Error!?Node.Index {
                         .main_token = ident,
                     });
                     errdefer self.nodes.orderedRemove(@intFromEnum(node_idx));
-                    const value = try self.expectExpr();
+                    // RHS allows bare-tuple syntax: `x = 1, 2, 3` makes x a tuple.
+                    const value = try self.parseRhsValue();
                     self.nodeData(node_idx).var_definition.value = value;
                     break :blk node_idx;
                 } else if (self.consumeOneOf(&.{ .plus_eq, .minus_eq, .star_eq, .slash_eq, .slash_slash_eq, .percent_eq, .pipe_eq })) |op_tok| {
@@ -405,6 +656,24 @@ pub fn parseExprWithoutOperators(self: *Parser) Error!?Node.Index {
                 break :blk try self.addNode(.{
                     .data = .{ .bool_not = operand },
                     .main_token = not_tok,
+                });
+            },
+            .minus => {
+                const tok = self.consumeNext();
+                // Unary minus binds tighter than binary operators: `-1 * 2`
+                // is `(-1) * 2`, not `-(1 * 2)`.
+                const operand = try self.parseExpr(50) orelse return self.fail(.expected_expr);
+                break :blk try self.addNode(.{
+                    .data = .{ .unary_minus = operand },
+                    .main_token = tok,
+                });
+            },
+            .plus => {
+                const tok = self.consumeNext();
+                const operand = try self.parseExpr(50) orelse return self.fail(.expected_expr);
+                break :blk try self.addNode(.{
+                    .data = .{ .unary_plus = operand },
+                    .main_token = tok,
                 });
             },
             .l_bracket => {
@@ -490,7 +759,7 @@ pub fn parseExprWithoutOperators(self: *Parser) Error!?Node.Index {
                 const args = try self.parseFnArgs();
                 _ = try self.expectConsume(.colon);
 
-                const body = try self.blockExpr(.{});
+                const body = try self.parseSuiteBody(ident);
                 self.nodeData(node_idx).* = .{
                     .def_proto = .{
                         .name = ident,
@@ -606,15 +875,51 @@ fn parseSuffix(self: *Parser, expr_idx: Node.Index) !?Node.Index {
     }
 
     if (self.consume(.l_bracket)) |lbracket| {
-        const idx_expr = try self.expectExpr();
+        // Parse: '[' [start] (':' [stop] (':' [step])?)? ']'
+        // - No colons  → plain index.
+        // - 1+ colons  → slice.
+        var start_expr: Node.Index = .none;
+        if (self.currentTag() != .colon) {
+            start_expr = try self.expectExpr();
+        }
+
+        if (self.consume(.colon) == null) {
+            // Plain indexing.
+            _ = try self.expectConsume(.r_bracket);
+            return try self.addNode(.{
+                .main_token = lbracket,
+                .data = .{
+                    .index = .{
+                        .obj = expr_idx,
+                        .idx = start_expr,
+                    },
+                },
+            });
+        }
+
+        // Slice: parse optional stop.
+        var stop_expr: Node.Index = .none;
+        if (self.currentTag() != .colon and self.currentTag() != .r_bracket) {
+            stop_expr = try self.expectExpr();
+        }
+
+        var step_expr: Node.Index = .none;
+        if (self.consume(.colon)) |_| {
+            if (self.currentTag() != .r_bracket) {
+                step_expr = try self.expectExpr();
+            }
+        }
+
         _ = try self.expectConsume(.r_bracket);
 
         return try self.addNode(.{
             .main_token = lbracket,
             .data = .{
-                .index = .{
+                .slice = .{
                     .obj = expr_idx,
-                    .idx = idx_expr,
+                    .start = start_expr,
+                    .stop = stop_expr,
+                    .step = step_expr,
                 },
             },
         });
@@ -700,19 +1005,33 @@ fn parseDictLiteral(self: *Parser) Error!Node.Index {
     });
 }
 
+fn parseSuiteBody(self: *Parser, main_tok: Token.Index) Error!Node.Index {
+    if (self.currentTag() == .newline or self.currentTag() == .block_start) {
+        return self.blockExpr(.{});
+    }
+    // Inline block
+    const stmt = try self.parseStatement();
+    const stmts = try self.arena.allocator().dupe(Node.Index, &.{stmt});
+    return self.addNode(.{
+        .main_token = main_tok,
+        .data = .{ .block = .{ .statements = stmts } },
+    });
+}
+
 fn parseIfStatement(self: *Parser) Error!Node.Index {
     const if_tok = self.consume(.keyword_if) orelse self.consume(.keyword_elif) orelse return self.fail(.expected_expr);
     const condition = try self.expectExpr();
     _ = try self.expectConsume(.colon);
-    const then_body = try self.blockExpr(.{});
+    const then_body = try self.parseSuiteBody(if_tok);
 
     var else_body: Node.Index = .none;
 
+    self.skipNewlines();
     if (self.currentTag() == .keyword_elif) {
         else_body = try self.parseIfStatement();
-    } else if (self.consume(.keyword_else)) |_| {
+    } else if (self.consume(.keyword_else)) |else_tok| {
         _ = try self.expectConsume(.colon);
-        else_body = try self.blockExpr(.{});
+        else_body = try self.parseSuiteBody(else_tok);
     }
 
     return try self.addNode(.{
@@ -733,7 +1052,7 @@ fn parseForLoop(self: *Parser) Error!Node.Index {
     _ = try self.expectConsume(.keyword_in);
     const iterable = try self.expectExpr();
     _ = try self.expectConsume(.colon);
-    const body = try self.blockExpr(.{});
+    const body = try self.parseSuiteBody(for_tok);
 
     return try self.addNode(.{
         .main_token = for_tok,
@@ -751,7 +1070,7 @@ fn parseWhileLoop(self: *Parser) Error!Node.Index {
     const while_tok = try self.expectConsume(.keyword_while);
     const condition = try self.expectExpr();
     _ = try self.expectConsume(.colon);
-    const body = try self.blockExpr(.{});
+    const body = try self.parseSuiteBody(while_tok);
 
     return try self.addNode(.{
         .main_token = while_tok,

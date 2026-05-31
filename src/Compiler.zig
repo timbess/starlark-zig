@@ -334,6 +334,58 @@ const ModuleCompiler = struct {
     }
 };
 
+/// Emit a store instruction for a single identifier target, choosing the
+/// right scope (local vs global) based on which compiler is active.
+fn emitStoreIdent(
+    name: []const u8,
+    builder: *CodeBuilder,
+    func_compiler: ?*FunctionCompiler,
+    module_compiler: ?*ModuleCompiler,
+) Error!void {
+    if (func_compiler) |fc| {
+        const idx = try fc.defineLocal(name);
+        try builder.emit(.{ .store = idx });
+    } else if (module_compiler) |mc| {
+        const idx = try mc.defineGlobal(name);
+        try builder.emit(.{ .store_global = idx });
+    } else unreachable;
+}
+
+/// Walk a target pattern (identifier or nested tuple_literal/list_literal)
+/// and emit the stores needed to consume one value from the top of the
+/// stack. Nested patterns emit an `unpack_seq` to break the value apart
+/// before recursing.
+fn emitUnpackTarget(
+    ast: *const Ast,
+    source: [:0]const u8,
+    builder: *CodeBuilder,
+    target_idx: Ast.Node.Index,
+    func_compiler: ?*FunctionCompiler,
+    module_compiler: ?*ModuleCompiler,
+) Error!void {
+    const node = ast.nodes.get(@intFromEnum(target_idx));
+    switch (node.data) {
+        .identifier => {
+            const tok = ast.tokens.get(@intFromEnum(node.main_token));
+            const name = source[tok.loc.start..tok.loc.end];
+            try emitStoreIdent(name, builder, func_compiler, module_compiler);
+        },
+        .tuple_literal => |tl| {
+            try builder.emit(.{ .unpack_seq = @intCast(tl.elements.len) });
+            for (tl.elements) |sub| {
+                try emitUnpackTarget(ast, source, builder, sub, func_compiler, module_compiler);
+            }
+        },
+        .list_literal => |ll| {
+            try builder.emit(.{ .unpack_seq = @intCast(ll.elements.len) });
+            for (ll.elements) |sub| {
+                try emitUnpackTarget(ast, source, builder, sub, func_compiler, module_compiler);
+            }
+        },
+        else => return Error.AstInvalid,
+    }
+}
+
 /// Emit the bytecode that materializes the function described by `d` at
 /// runtime: evaluates each default-value expression in the enclosing scope,
 /// then emits `make_function` (or `load_const` when there is nothing to bind).
@@ -422,12 +474,15 @@ fn isExpressionTag(tag: Ast.Node.Tag) bool {
         .tuple_literal,
         .dict_literal,
         .index,
+        .slice,
         .bool_not,
         .bool_and,
         .bool_or,
         .get_attribute,
         .lambda,
         .if_expression,
+        .unary_minus,
+        .unary_plus,
         => true,
         else => false,
     };
@@ -528,9 +583,18 @@ fn compileExpr(
             emit_build_tuple,
             emit_build_dict,
             emit_get_index,
+            emit_get_slice,
+            emit_unary_neg,
         },
         node_idx: Ast.Node.Index,
         extra: u32 = 0, // Used for arity in calls, binop type
+    };
+
+    const SliceMask = packed struct(u32) {
+        start: bool = false,
+        stop: bool = false,
+        step: bool = false,
+        _pad: u29 = 0,
     };
 
     var work_buffer: [256]ExprWork = undefined;
@@ -652,6 +716,13 @@ fn compileExpr(
                         try work_stack.appendBounded(.{ .kind = .emit_bool_not, .node_idx = work.node_idx });
                         try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = operand });
                     },
+                    .unary_minus => |operand| {
+                        try work_stack.appendBounded(.{ .kind = .emit_unary_neg, .node_idx = work.node_idx });
+                        try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = operand });
+                    },
+                    .unary_plus => |operand| {
+                        try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = operand });
+                    },
                     .get_attribute => |getattr| {
                         try work_stack.appendBounded(.{ .kind = .emit_getattr, .node_idx = work.node_idx, .extra = @intFromEnum(getattr.attr) });
                         try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = getattr.obj });
@@ -685,6 +756,17 @@ fn compileExpr(
                         try work_stack.appendBounded(.{ .kind = .emit_get_index, .node_idx = work.node_idx });
                         try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = idx.idx });
                         try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = idx.obj });
+                    },
+                    .slice => |sl| {
+                        var mask: SliceMask = .{};
+                        if (sl.start != .none) mask.start = true;
+                        if (sl.stop != .none) mask.stop = true;
+                        if (sl.step != .none) mask.step = true;
+                        try work_stack.appendBounded(.{ .kind = .emit_get_slice, .node_idx = work.node_idx, .extra = @bitCast(mask) });
+                        if (sl.step != .none) try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = sl.step });
+                        if (sl.stop != .none) try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = sl.stop });
+                        if (sl.start != .none) try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = sl.start });
+                        try work_stack.appendBounded(.{ .kind = .compile_expr, .node_idx = sl.obj });
                     },
                     .lambda => |l| {
                         const arena_alloc: Allocator = if (func_compiler) |fc| fc.arena else if (module_compiler) |mc| mc.arena else unreachable;
@@ -726,11 +808,35 @@ fn compileExpr(
             .emit_get_index => {
                 try builder.emit(.get_index);
             },
+            .emit_get_slice => {
+                const mask: SliceMask = @bitCast(work.extra);
+                try builder.emit(.{ .get_slice = constructFromMatching(Runtime.GetSliceOpts, mask) });
+            },
+            .emit_unary_neg => {
+                try builder.emit(.unary_neg);
+            },
             .emit_store => {
                 // Used by other compilation contexts
             },
         }
     }
+}
+
+fn constructFromMatching(comptime T: type, source: anytype) T {
+    const SourceType = @TypeOf(source);
+    const target_info = @typeInfo(T).@"struct";
+
+    var result: T = undefined;
+
+    inline for (target_info.fields) |target_field| {
+        if (@hasField(SourceType, target_field.name)) {
+            @field(result, target_field.name) = @field(source, target_field.name);
+        } else {
+            @compileError("Missing field: " ++ target_field.name);
+        }
+    }
+
+    return result;
 }
 
 fn compileIf(
@@ -1008,8 +1114,10 @@ fn compileFunction(
         if (arg_node.data.fn_arg.default != .none) {
             seen_default = true;
         } else {
-            if (seen_default) return Error.AstInvalid; // required param after default
-            num_required += 1;
+            // A required param after a default is well-formed when it
+            // follows `*` (keyword-only); we don't model that distinction
+            // yet, so we accept it and let a bad call fail at runtime.
+            if (!seen_default) num_required += 1;
         }
     }
 
@@ -1027,6 +1135,22 @@ fn compileFunction(
                 const binding_src = source[binding_tok.loc.start..binding_tok.loc.end];
                 const local_idx = try func_compiler.defineLocal(binding_src);
                 try func_compiler.base.emit(.{ .store = local_idx });
+            },
+            .unpack_assignment => |ua| {
+                try compileExpr(ast, source, &func_compiler.base, &func_compiler.scope, ua.value, &func_compiler, null);
+                try emitUnpackTarget(ast, source, &func_compiler.base, ua.target, &func_compiler, null);
+            },
+            .set_item => |si| {
+                try compileExpr(ast, source, &func_compiler.base, &func_compiler.scope, si.obj, &func_compiler, null);
+                try compileExpr(ast, source, &func_compiler.base, &func_compiler.scope, si.idx, &func_compiler, null);
+                try compileExpr(ast, source, &func_compiler.base, &func_compiler.scope, si.value, &func_compiler, null);
+                try func_compiler.base.emit(.set_index);
+            },
+            .set_attr => |sa| {
+                try compileExpr(ast, source, &func_compiler.base, &func_compiler.scope, sa.obj, &func_compiler, null);
+                try compileExpr(ast, source, &func_compiler.base, &func_compiler.scope, sa.value, &func_compiler, null);
+                const tok = ast.tokens.get(@intFromEnum(sa.attr));
+                try func_compiler.base.emit(.{ .set_attr = source[tok.loc.start..tok.loc.end] });
             },
             .def_proto => |d| {
                 const result = try compileDefProto(ast, source, &func_compiler.base, &func_compiler.scope, &func_compiler, null, gc, arena, interner, d);
@@ -1139,6 +1263,22 @@ fn compileModule(
                 const binding_src = source[binding_tok.loc.start..binding_tok.loc.end];
                 const global_idx = try module_compiler.defineGlobal(binding_src);
                 try module_compiler.base.emit(.{ .store_global = global_idx });
+            },
+            .unpack_assignment => |ua| {
+                try compileExpr(ast, source, &module_compiler.base, &module_compiler.scope, ua.value, null, &module_compiler);
+                try emitUnpackTarget(ast, source, &module_compiler.base, ua.target, null, &module_compiler);
+            },
+            .set_item => |si| {
+                try compileExpr(ast, source, &module_compiler.base, &module_compiler.scope, si.obj, null, &module_compiler);
+                try compileExpr(ast, source, &module_compiler.base, &module_compiler.scope, si.idx, null, &module_compiler);
+                try compileExpr(ast, source, &module_compiler.base, &module_compiler.scope, si.value, null, &module_compiler);
+                try module_compiler.base.emit(.set_index);
+            },
+            .set_attr => |sa| {
+                try compileExpr(ast, source, &module_compiler.base, &module_compiler.scope, sa.obj, null, &module_compiler);
+                try compileExpr(ast, source, &module_compiler.base, &module_compiler.scope, sa.value, null, &module_compiler);
+                const tok = ast.tokens.get(@intFromEnum(sa.attr));
+                try module_compiler.base.emit(.{ .set_attr = source[tok.loc.start..tok.loc.end] });
             },
             .def_proto => |d| {
                 const result = try compileDefProto(ast, source, &module_compiler.base, &module_compiler.scope, null, &module_compiler, gc, arena, interner, d);

@@ -86,6 +86,7 @@ pub const Node = struct {
         list_literal,
         dict_literal,
         index,
+        slice,
         @"if",
         @"for",
         @"while",
@@ -100,6 +101,11 @@ pub const Node = struct {
         @"break",
         @"continue",
         pass,
+        unary_minus,
+        unary_plus,
+        unpack_assignment,
+        set_item,
+        set_attr,
     };
 
     pub const Data = union(Tag) {
@@ -160,6 +166,12 @@ pub const Node = struct {
             obj: Node.Index,
             idx: Node.Index,
         },
+        slice: struct {
+            obj: Node.Index,
+            start: Node.Index, // .none if absent
+            stop: Node.Index, // .none if absent
+            step: Node.Index, // .none if absent
+        },
         @"if": struct {
             condition: Node.Index,
             then_body: Node.Index,
@@ -191,6 +203,22 @@ pub const Node = struct {
         @"break": void,
         @"continue": void,
         pass: void,
+        unary_minus: Node.Index,
+        unary_plus: Node.Index,
+        unpack_assignment: struct {
+            target: Node.Index,
+            value: Node.Index,
+        },
+        set_item: struct {
+            obj: Node.Index,
+            idx: Node.Index,
+            value: Node.Index,
+        },
+        set_attr: struct {
+            obj: Node.Index,
+            attr: Token.Index,
+            value: Node.Index,
+        },
     };
 };
 

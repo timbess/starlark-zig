@@ -136,6 +136,12 @@ fn runSpecFile(comptime name: []const u8, comptime source: []const u8) TestRepor
             var rt = Runtime.init(std.testing.allocator, .{ .gc = gc }) catch break :blk false;
             defer rt.deinit();
 
+            // Per-chunk Diagnostic so dunders can attach operand-specific
+            // messages reachable to test_predeclared's `errString`.
+            var diag: Runtime.Diagnostic = .{};
+            defer diag.deinit();
+            rt.diagnostic = &diag;
+
             rt.registerStdlib(stdlib.Stdlib) catch break :blk false;
             test_predeclared.register(&rt, gc) catch break :blk false;
             rt.execModule(&module) catch {
